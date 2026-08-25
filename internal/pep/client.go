@@ -1497,6 +1497,20 @@ type laneJoinResult struct {
 // this endpoint is the ordinary way to reach it.
 var errLaneJoinRejected = errors.New("lane join rejected")
 
+// errBulkConnectionLimit is a scheduling answer, not a transport failure.
+// The caller keeps the flow on its pooled control connection when every
+// isolation slot is occupied. Falling back to a dedicated connection here
+// would silently bypass the descriptor and handshake budget this limit exists
+// to enforce.
+var errBulkConnectionLimit = errors.New("bulk lane connection limit reached")
+
+func dedicatedBulkFallbackAllowed(err error) bool {
+	return err != nil &&
+		!errors.Is(err, errBulkConnectionLimit) &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded)
+}
+
 func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID [16]byte, flowID, laneID uint64) (*mpLane, error) {
 	if kind != TransportQUIC && kind != TransportTCP {
 		return nil, fmt.Errorf("unsupported join transport %q", kind)
@@ -1504,6 +1518,8 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 	if kind == TransportQUIC && c.cfg.EnableQUICPool {
 		if lane, poolErr := c.openPooledJoinLane(ctx, sessionID, flowID, laneID); poolErr == nil {
 			return lane, nil
+		} else if !dedicatedBulkFallbackAllowed(poolErr) {
+			return nil, poolErr
 		} else {
 			c.cfg.Logger.Debug("pooled lane join unavailable; using dedicated lane", "error", poolErr)
 		}
@@ -1637,7 +1653,7 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 	}
 	if len(c.bulkConns) >= c.maxBulkConns() {
 		c.bulkMu.Unlock()
-		return nil, errors.New("bulk lane connection limit reached")
+		return nil, errBulkConnectionLimit
 	}
 	c.bulkMu.Unlock()
 
@@ -1651,7 +1667,7 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 	if len(c.bulkConns) >= c.maxBulkConns() {
 		c.bulkMu.Unlock()
 		entry.close("queqiao bulk pool limit reached")
-		return nil, errors.New("bulk lane connection limit reached")
+		return nil, errBulkConnectionLimit
 	}
 	entry.busy = true
 	c.bulkConns = append(c.bulkConns, entry)
@@ -1880,7 +1896,11 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 							c.cfg.Logger.Debug("peer refused lane join; flow stays on the shared connection", "lane", result.id, "error", result.err)
 							break
 						}
-						c.cfg.Logger.Warn("bulk isolation lane unavailable", "lane", result.id, "error", result.err)
+						if errors.Is(result.err, errBulkConnectionLimit) {
+							c.cfg.Logger.Debug("bulk isolation capacity occupied; flow stays on the shared connection", "lane", result.id)
+						} else {
+							c.cfg.Logger.Warn("bulk isolation lane unavailable", "lane", result.id, "error", result.err)
+						}
 						if isolationBackoff == 0 {
 							isolationBackoff = minLaneProbeBackoff
 						} else if isolationBackoff < maxLaneProbeBackoff {
