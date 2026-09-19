@@ -64,6 +64,14 @@ public final class MainActivity extends Activity implements TunnelHost {
         thread.setDaemon(true);
         return thread;
     });
+    // Connection tests run side by side, up to the same four at a time as iOS: a
+    // slow or unreachable provider should not hold up the verdict on the others.
+    private static final int MAX_CONCURRENT_PROBES = 4;
+    private final ExecutorService probePool = Executors.newFixedThreadPool(MAX_CONCURRENT_PROBES, runnable -> {
+        Thread thread = new Thread(runnable, "queqiao-probe");
+        thread.setDaemon(true);
+        return thread;
+    });
     private UiKit ui;
     private List<TunnelController> modes;
     private TunnelController controller;
@@ -156,6 +164,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     @Override
     protected void onDestroy() {
         worker.shutdownNow();
+        probePool.shutdownNow();
         super.onDestroy();
     }
 
@@ -803,8 +812,9 @@ public final class MainActivity extends Activity implements TunnelHost {
         }
         showPage(currentPage);
         renderConnectionState();
-        worker.execute(() -> {
-            for (String profileId : profileIds) {
+        int[] remaining = {profileIds.size()};
+        for (String profileId : profileIds) {
+            probePool.execute(() -> {
                 ConnectionProbe outcome;
                 try {
                     ProfileRepository.ActiveProfile active = repository.profile(profileId);
@@ -817,21 +827,19 @@ public final class MainActivity extends Activity implements TunnelHost {
                     outcome = ConnectionProbe.unavailable(exception, VpnExclusion.current(this));
                 }
                 ConnectionProbe completed = outcome;
+                // The count lives on the UI thread, where every completion lands.
                 runOnUiThread(() -> {
                     profileProbes.put(profileId, completed);
+                    if (--remaining[0] == 0) {
+                        testingProfiles = false;
+                        renderConnectionState();
+                    }
                     if (currentPage == Page.PROFILES) {
                         showPage(Page.PROFILES);
                     }
                 });
-            }
-            runOnUiThread(() -> {
-                testingProfiles = false;
-                if (currentPage == Page.PROFILES) {
-                    showPage(Page.PROFILES);
-                }
-                renderConnectionState();
             });
-        });
+        }
     }
 
     private void refreshCatalog() {
