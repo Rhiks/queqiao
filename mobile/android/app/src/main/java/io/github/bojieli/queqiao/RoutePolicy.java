@@ -113,6 +113,12 @@ final class RoutePolicy {
                 builder.addRoute("0.0.0.0", 0);
                 builder.addRoute("::", 0);
                 for (RouteSpec route : plan.excluded) {
+                    // Android refuses a loopback prefix outright, and loopback never
+                    // reaches a VPN interface, so the shared local list's entries for
+                    // it have nothing to exclude here.
+                    if (route.inetAddress().isLoopbackAddress()) {
+                        continue;
+                    }
                     builder.excludeRoute(new IpPrefix(route.inetAddress(), route.prefixLength));
                 }
             } else {

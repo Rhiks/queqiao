@@ -173,6 +173,13 @@ public final class SecureStoreTestRunner extends Instrumentation {
         require(withChina.excluded.size() > plan.excluded.size()
                         && withChina.excluded.size() <= RoutePolicy.ROUTE_LIMIT,
                 "the country set was not added within the route limit");
+
+        // The builder validates every prefix it is handed (it refuses loopback, for
+        // one), so the whole plan has to survive the real thing, not just the model.
+        RoutePolicy.apply(new android.net.VpnService().new Builder(),
+                routing.withBypassChinaDirect(true)
+                        .withCustomRoutes(java.util.Arrays.asList("203.0.113.0/24", "127.0.0.1", "::1")),
+                chinaDirect);
         require(isRouted(routes, "8.8.8.8"), "public IPv4 address is not routed");
         require(isRouted(routes, "2001:4860:4860::8888"), "public IPv6 address is not routed");
         require(!isRouted(routes, "10.0.0.1"), "private IPv4 address is routed");
