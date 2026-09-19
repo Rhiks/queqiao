@@ -86,6 +86,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     private TextView downloadedView;
     private TextView uploadedView;
     private TextView flowsView;
+    private TextView routedView;
     private Button connectionButton;
     private Page currentPage = Page.HOME;
     private String tunnelState = Mobilecore.StateStopped;
@@ -96,6 +97,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     private long bytesUp;
     private long bytesDown;
     private long activeFlows;
+    private String routedSummary = "";
     private final Map<String, ConnectionProbe> profileProbes = new HashMap<>();
     // The import dialog stays up while the scanner is in front, so a scanned
     // invitation lands in the field the user was looking at; if the system
@@ -297,6 +299,12 @@ public final class MainActivity extends Activity implements TunnelHost {
             row.addView(uploadedView, UiKit.weightedWrap());
             row.addView(flowsView, UiKit.weightedWrap());
             metrics.addView(row, UiKit.matchWrap());
+            // What the rule list decided, so "my rules are working" is something
+            // the screen can show rather than something the user has to infer.
+            routedView = ui.text(routedSummary, 13, Typeface.NORMAL);
+            routedView.setPadding(0, ui.dp(10), 0, 0);
+            routedView.setVisibility(routedSummary.isEmpty() ? View.GONE : View.VISIBLE);
+            metrics.addView(routedView, UiKit.matchWrap());
             content.addView(metrics, ui.spacedCard());
         }
 
@@ -890,6 +898,8 @@ public final class MainActivity extends Activity implements TunnelHost {
                     R.string.uploaded_metric,
                     formatBytes(bytesUp)));
             flowsView.setText(getString(R.string.active_flows_metric, activeFlows));
+            routedView.setText(routedSummary);
+            routedView.setVisibility(routedSummary.isEmpty() ? View.GONE : View.VISIBLE);
         }
     }
 
@@ -911,6 +921,7 @@ public final class MainActivity extends Activity implements TunnelHost {
                 bytesUp = 0;
                 bytesDown = 0;
                 activeFlows = 0;
+                routedSummary = "";
             }
             return;
         }
@@ -921,6 +932,13 @@ public final class MainActivity extends Activity implements TunnelHost {
                 bytesDown = transport.optLong("BytesDown", 0);
                 activeFlows = transport.optLong("ActiveFlows", 0);
             }
+            JSONObject packets = new JSONObject(encoded).optJSONObject("packets");
+            JSONObject routing = packets == null ? null : packets.optJSONObject("routing");
+            routedSummary = routing == null || routing.optInt("rules", 0) == 0
+                    ? ""
+                    : "Rules sent " + routing.optLong("proxied", 0) + " flows through Queqiao, "
+                            + routing.optLong("directed", 0) + " direct, "
+                            + routing.optLong("rejected", 0) + " rejected";
         } catch (Exception ignored) {
             // Metrics are optional UI decoration and never affect tunnel state.
         }

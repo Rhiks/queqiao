@@ -6,4 +6,6 @@ Hand-entered routes are read as numeric addresses only, so a typo is refused
 instead of being looked up. The address set installs as routes on Android 13
 and later; earlier releases keep those addresses direct through a
 `GEOIP,CN,DIRECT` rule. Routing is edited while disconnected and applies at
-the next connect.
+the next connect. While connected, the
+home screen shows how many flows the rules sent through Queqiao, direct, or
+rejected.
