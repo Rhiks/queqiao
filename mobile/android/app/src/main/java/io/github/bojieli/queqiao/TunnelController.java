@@ -33,12 +33,6 @@ interface TunnelController {
      */
     Intent consentIntent();
 
-    /**
-     * Whether the profile connection test may run while this mode is connected.
-     * A mode that captures the app's own sockets has to answer no, because the
-     * test would then measure the tunnel rather than the provider.
-     */
-    boolean allowsProviderTestWhileConnected();
 
     void connect(String profileId);
 

@@ -102,9 +102,10 @@ device authorization, protocol negotiation, and one authenticated control round
 trip, and opens no remote destination. A loop shows there as a provider that
 cannot be reached — loudly, and before any real traffic is affected.
 
-The same reasoning applies in reverse to the debug tunnel: a mode that captures
-the app's own sockets answers no to `allowsProviderTestWhileConnected`, because
-the test would then be measuring the tunnel rather than the provider.
+The debug full tunnel allows the test while connected for a different reason:
+it excludes the app's own UID from the interface it installs, so the probe
+leaves by the device's ordinary route and still measures the provider rather
+than the tunnel.
 
 ## Client configuration
 

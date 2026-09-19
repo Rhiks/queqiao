@@ -794,13 +794,6 @@ public final class MainActivity extends Activity implements TunnelHost {
     }
 
     private void testProfiles(java.util.List<String> profileIds) {
-        if (isTunnelActive() && !controller.allowsProviderTestWhileConnected()) {
-            showFailure(
-                    "Disconnect first",
-                    new IllegalStateException(
-                            "Disconnect the " + controller.noun() + " before testing provider connections"));
-            return;
-        }
         if (!canTestProfiles() || profileIds.isEmpty()) {
             return;
         }
@@ -1146,8 +1139,10 @@ public final class MainActivity extends Activity implements TunnelHost {
     }
 
     private boolean canTestProfiles() {
-        boolean blockedByConnection = isTunnelActive() && !controller.allowsProviderTestWhileConnected();
-        return !blockedByConnection && !busy && !testingProfiles;
+        // A test may run while connected in either mode: the full tunnel excludes
+        // this app's UID, and export mode holds no interface, so the probe always
+        // leaves by the device's ordinary route rather than through Queqiao.
+        return !busy && !testingProfiles;
     }
 
     private boolean isTransitioning() {
