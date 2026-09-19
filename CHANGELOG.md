@@ -10,6 +10,36 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.8.0 - 2026-09-19
+
+### Added
+
+- The Android app ships the full-device tunnel, and it is the default connection
+  mode for a new install. Until now a released build could only export a local
+  SOCKS5 endpoint for another VPN client, which left a phone with no such client
+  unable to connect at all. Both modes ship and are chosen under Settings; an
+  install that had already picked one keeps it. Because the release build now
+  declares a `VpnService`, a Google Play listing needs an Organization account
+  and Play's VPN declaration; direct APK distribution is unaffected.
+- The Android full tunnel routes the way the iOS tunnel does: a routing mode,
+  bypasses for local networks, the bundled Chinese address set and up to 256
+  hand-entered routes, and a rule-list editor with the same lint and the same
+  China preset, which keeps Chinese sites direct by name as well as by address.
+  Hand-entered routes are read as numeric addresses only, so a typo is refused
+  instead of being looked up. The address set installs as routes on Android 13
+  and later; earlier releases keep those addresses direct through a
+  `GEOIP,CN,DIRECT` rule. Routing is edited while disconnected and applies at
+  the next connect. While connected, the
+  home screen shows how many flows the rules sent through Queqiao, direct, or
+  rejected.
+
+### Changed
+
+- "Test all connections" on Android probes up to four profiles at once, as iOS
+  already did, and shows each result as it arrives; one slow or unreachable
+  provider no longer delays the verdict on the rest. Connection tests can also
+  be run while the tunnel is connected.
+
 ## v0.7.0 - 2026-09-19
 
 ### Added
