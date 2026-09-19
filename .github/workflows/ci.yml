@@ -246,8 +246,11 @@ jobs:
           # talks to one gateway has a small, enumerable set of things to ask
           # for, and anything outside it arrived by accident or by a merged
           # library manifest. Update the list deliberately, with a reason.
+          # CAMERA: ScanInvitationActivity reads a queqiao:// invitation from
+          # a QR code; the frame is decoded in process by the Go core.
           expected=$(printf '%s\n' \
             android.permission.ACCESS_NETWORK_STATE \
+            android.permission.CAMERA \
             android.permission.FOREGROUND_SERVICE \
             android.permission.FOREGROUND_SERVICE_SPECIAL_USE \
             android.permission.INTERNET \

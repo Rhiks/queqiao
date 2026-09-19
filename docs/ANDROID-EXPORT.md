@@ -20,10 +20,13 @@ The full-device tunnel still exists, in the debug build only. See
 ## What the released app declares
 
 - `INTERNET`, `POST_NOTIFICATIONS`, `FOREGROUND_SERVICE`,
-  `FOREGROUND_SERVICE_SPECIAL_USE`, and `ACCESS_NETWORK_STATE`. The last is
-  read-only and serves one question — whether another app's VPN is carrying
-  Queqiao's own uplink — described under
+  `FOREGROUND_SERVICE_SPECIAL_USE`, `ACCESS_NETWORK_STATE`, and `CAMERA`.
+  `ACCESS_NETWORK_STATE` is read-only and serves one question — whether
+  another app's VPN is carrying Queqiao's own uplink — described under
   [the exclusion check](#first-exclude-queqiao-from-the-consumers-tunnel).
+  `CAMERA` is optional and is held only by the invitation scanner while it
+  is in front; the QR code is decoded in process by the Go core, and the
+  camera feature is declared as not required so the app installs without one.
 - One service, `QueqiaoProxyService`, type `specialUse`, with a subtype
   justification naming what it actually does: it serves a local SOCKS5 endpoint
   for a network client the user configured, and the connection has to outlive

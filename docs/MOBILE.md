@@ -90,6 +90,7 @@ the linked primary sources are authoritative.
 | Product model | SOCKS5 helper | SOCKS5 helper | Full-device tunnel |
 | Owner of routing policy | Clash/mihomo | The consumer VPN client (debug build: Queqiao) | Queqiao |
 | One-time `queqiao://` enrollment | Yes | Yes | Yes |
+| Invitation from a QR code | `provider invite --qr` draws it | Camera scan, decoded by the Go core | Camera scan, detected by AVFoundation |
 | Crash-safe enrollment draft | Mode-0600 file | Keystore-encrypted | This-device-only Keychain |
 | TLS 1.3 mutual authentication and root pin | Yes | Same core | Same core |
 | Hourly certificate maintenance | Yes | Yes | Yes |
@@ -139,7 +140,15 @@ platforms; what differs is what a connection *is*.
   as a false disconnect.
 
 Both apps import a `queqiao://` invitation through an explicit in-app paste
-action; Android can also appear as a user-selected target for shared plain text.
+action or by scanning it as a QR code with the device camera, which is what
+`queqiaod provider invite --qr` draws in the provider's terminal. Android can
+also appear as a user-selected target for shared plain text. The camera opens
+only from the import screen and only while that screen is in front. On Android
+the frame is decoded on the device by the Go core; on iOS the detection is
+AVFoundation's own. On neither platform does the image or the decoded
+invitation leave the process, and both platforms validate the scanned
+invitation before it reaches the form, so a QR code that is not a Queqiao
+invitation is refused rather than imported.
 They intentionally do not register the `queqiao` custom URL scheme because
 mobile platforms cannot authenticate which installed application owns a custom
 scheme, while an unused invitation is a bearer credential. Enrollment remains
@@ -268,8 +277,11 @@ The packet adapter, SOCKS5 CONNECT/UDP ASSOCIATE implementation, lifecycle,
 storage integration, and platform UI are maintained in this repository. The
 only non-Queqiao runtime networking foundation added for mobile is the actively
 maintained Apache-2.0 gVisor netstack; it supplies TCP/IP state machines, not a
-proxy protocol or application. Android UI uses only the platform SDK, and iOS
-uses only Apple system frameworks.
+proxy protocol or application. The Android QR-code reader is the MIT-licensed
+[goqr](https://github.com/liyue201/goqr) port of quirc, linked into the Go core
+so a camera frame is decoded in process; the camera itself is the platform
+Camera2 API. Android UI uses only the platform SDK, and iOS uses only Apple
+system frameworks.
 
 Every linked Go module is pinned in `mobile/runtime-dependencies.lock`, limited
 to MIT, BSD-3-Clause, or Apache-2.0, and checked from the compiled package graph
