@@ -10,6 +10,23 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.7.0 - 2026-09-19
+
+### Added
+
+- The Android and iOS apps can read a one-time invitation from a QR code with
+  the device camera, from the same import screen that takes a pasted one. Five
+  hundred characters of base64 were never going to be typed from another
+  screen. Android decodes the frame on the device in the Go core and iOS uses
+  the system's own detector; no image or invitation leaves the process, and a
+  scanned code that is not a valid Queqiao invitation is refused at the
+  viewfinder. The released Android build gains only the CAMERA permission,
+  which is optional.
+- `queqiaod provider invite --qr` draws the new invitation as a QR code in the
+  terminal, black on a white field whatever the terminal theme, for the mobile
+  apps to scan. It goes to standard error, so standard output is still exactly
+  the URI and piping it into a portal keeps working.
+
 ## v0.6.3 - 2026-09-07
 
 ### Fixed
