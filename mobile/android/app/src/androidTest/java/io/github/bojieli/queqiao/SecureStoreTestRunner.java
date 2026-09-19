@@ -216,7 +216,7 @@ public final class SecureStoreTestRunner extends Instrumentation {
         // has no public constructor or builder, so the only capabilities an
         // instrumented test can obtain are the ones the device actually has.
         // Standing up a real VpnService to produce one would be testing the
-        // debug tunnel, not this. What remains checkable is checked.
+        // full tunnel, not this. What remains checkable is checked.
     }
 
     /**
