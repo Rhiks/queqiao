@@ -64,6 +64,14 @@ public final class MainActivity extends Activity implements TunnelHost {
         thread.setDaemon(true);
         return thread;
     });
+    // Connection tests run side by side, up to the same four at a time as iOS: a
+    // slow or unreachable provider should not hold up the verdict on the others.
+    private static final int MAX_CONCURRENT_PROBES = 4;
+    private final ExecutorService probePool = Executors.newFixedThreadPool(MAX_CONCURRENT_PROBES, runnable -> {
+        Thread thread = new Thread(runnable, "queqiao-probe");
+        thread.setDaemon(true);
+        return thread;
+    });
     private UiKit ui;
     private List<TunnelController> modes;
     private TunnelController controller;
@@ -78,6 +86,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     private TextView downloadedView;
     private TextView uploadedView;
     private TextView flowsView;
+    private TextView routedView;
     private Button connectionButton;
     private Page currentPage = Page.HOME;
     private String tunnelState = Mobilecore.StateStopped;
@@ -88,6 +97,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     private long bytesUp;
     private long bytesDown;
     private long activeFlows;
+    private String routedSummary = "";
     private final Map<String, ConnectionProbe> profileProbes = new HashMap<>();
     // The import dialog stays up while the scanner is in front, so a scanned
     // invitation lands in the field the user was looking at; if the system
@@ -156,6 +166,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     @Override
     protected void onDestroy() {
         worker.shutdownNow();
+        probePool.shutdownNow();
         super.onDestroy();
     }
 
@@ -288,6 +299,12 @@ public final class MainActivity extends Activity implements TunnelHost {
             row.addView(uploadedView, UiKit.weightedWrap());
             row.addView(flowsView, UiKit.weightedWrap());
             metrics.addView(row, UiKit.matchWrap());
+            // What the rule list decided, so "my rules are working" is something
+            // the screen can show rather than something the user has to infer.
+            routedView = ui.text(routedSummary, 13, Typeface.NORMAL);
+            routedView.setPadding(0, ui.dp(10), 0, 0);
+            routedView.setVisibility(routedSummary.isEmpty() ? View.GONE : View.VISIBLE);
+            metrics.addView(routedView, UiKit.matchWrap());
             content.addView(metrics, ui.spacedCard());
         }
 
@@ -803,8 +820,9 @@ public final class MainActivity extends Activity implements TunnelHost {
         }
         showPage(currentPage);
         renderConnectionState();
-        worker.execute(() -> {
-            for (String profileId : profileIds) {
+        int[] remaining = {profileIds.size()};
+        for (String profileId : profileIds) {
+            probePool.execute(() -> {
                 ConnectionProbe outcome;
                 try {
                     ProfileRepository.ActiveProfile active = repository.profile(profileId);
@@ -817,21 +835,19 @@ public final class MainActivity extends Activity implements TunnelHost {
                     outcome = ConnectionProbe.unavailable(exception, VpnExclusion.current(this));
                 }
                 ConnectionProbe completed = outcome;
+                // The count lives on the UI thread, where every completion lands.
                 runOnUiThread(() -> {
                     profileProbes.put(profileId, completed);
+                    if (--remaining[0] == 0) {
+                        testingProfiles = false;
+                        renderConnectionState();
+                    }
                     if (currentPage == Page.PROFILES) {
                         showPage(Page.PROFILES);
                     }
                 });
-            }
-            runOnUiThread(() -> {
-                testingProfiles = false;
-                if (currentPage == Page.PROFILES) {
-                    showPage(Page.PROFILES);
-                }
-                renderConnectionState();
             });
-        });
+        }
     }
 
     private void refreshCatalog() {
@@ -882,6 +898,8 @@ public final class MainActivity extends Activity implements TunnelHost {
                     R.string.uploaded_metric,
                     formatBytes(bytesUp)));
             flowsView.setText(getString(R.string.active_flows_metric, activeFlows));
+            routedView.setText(routedSummary);
+            routedView.setVisibility(routedSummary.isEmpty() ? View.GONE : View.VISIBLE);
         }
     }
 
@@ -903,6 +921,7 @@ public final class MainActivity extends Activity implements TunnelHost {
                 bytesUp = 0;
                 bytesDown = 0;
                 activeFlows = 0;
+                routedSummary = "";
             }
             return;
         }
@@ -913,6 +932,13 @@ public final class MainActivity extends Activity implements TunnelHost {
                 bytesDown = transport.optLong("BytesDown", 0);
                 activeFlows = transport.optLong("ActiveFlows", 0);
             }
+            JSONObject packets = new JSONObject(encoded).optJSONObject("packets");
+            JSONObject routing = packets == null ? null : packets.optJSONObject("routing");
+            routedSummary = routing == null || routing.optInt("rules", 0) == 0
+                    ? ""
+                    : "Rules sent " + routing.optLong("proxied", 0) + " flows through Queqiao, "
+                            + routing.optLong("directed", 0) + " direct, "
+                            + routing.optLong("rejected", 0) + " rejected";
         } catch (Exception ignored) {
             // Metrics are optional UI decoration and never affect tunnel state.
         }
@@ -1038,9 +1064,8 @@ public final class MainActivity extends Activity implements TunnelHost {
     }
 
     /**
-     * The mode picker exists only where more than one mode is compiled in, which
-     * today means the debug build. Switching while connected would leave the
-     * other service running with nothing on screen driving it.
+     * Switching while connected would leave the other service running with
+     * nothing on screen driving it.
      */
     @SuppressLint("SetTextI18n")
     private View buildModeCard() {

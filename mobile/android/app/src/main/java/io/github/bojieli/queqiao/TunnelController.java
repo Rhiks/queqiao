@@ -4,10 +4,8 @@ import android.content.Intent;
 import android.widget.LinearLayout;
 
 /**
- * One way this app can carry traffic. The released build offers a single mode —
- * an exported SOCKS listener that another VPN client routes into — while the
- * debug build additionally offers the full-device tunnel that exercises the
- * packet stack.
+ * One way this app can carry traffic: the full-device tunnel, or an exported
+ * SOCKS listener that another VPN client routes into.
  *
  * The activity owns the profile catalog, the connection button, and the metric
  * counters, which are identical across modes. Everything a mode does
