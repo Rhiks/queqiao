@@ -1038,9 +1038,8 @@ public final class MainActivity extends Activity implements TunnelHost {
     }
 
     /**
-     * The mode picker exists only where more than one mode is compiled in, which
-     * today means the debug build. Switching while connected would leave the
-     * other service running with nothing on screen driving it.
+     * Switching while connected would leave the other service running with
+     * nothing on screen driving it.
      */
     @SuppressLint("SetTextI18n")
     private View buildModeCard() {

@@ -48,6 +48,25 @@
             android:exported="false"
             android:label="@string/scan_invitation_title" />
 
+        <!-- The full-device tunnel. Android requires the service to be
+             protected by BIND_VPN_SERVICE so only the system can bind it;
+             always-on is declined because a profile must be chosen in the
+             app before a connection means anything. -->
+        <service
+            android:name=".QueqiaoVpnService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn" />
+            <meta-data
+                android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
+                android:value="false" />
+        </service>
         <service
             android:name=".QueqiaoProxyService"
             android:exported="false"
