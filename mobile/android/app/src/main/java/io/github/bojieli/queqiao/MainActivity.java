@@ -49,6 +49,7 @@ import mobilecore.Mobilecore;
 public final class MainActivity extends Activity implements TunnelHost {
     private static final int REQUEST_CONSENT = 7001;
     private static final int REQUEST_NOTIFICATIONS = 7002;
+    private static final int REQUEST_SCAN_INVITATION = 7003;
     private static final String PREFERENCES = "io.github.bojieli.queqiao.ui";
     private static final String PREFERENCE_MODE = "mode";
 
@@ -88,6 +89,11 @@ public final class MainActivity extends Activity implements TunnelHost {
     private long bytesDown;
     private long activeFlows;
     private final Map<String, ConnectionProbe> profileProbes = new HashMap<>();
+    // The import dialog stays up while the scanner is in front, so a scanned
+    // invitation lands in the field the user was looking at; if the system
+    // reclaimed the activity meanwhile, the dialog is rebuilt around the value.
+    private AlertDialog importDialog;
+    private EditText importInvitationField;
     private boolean testingProfiles;
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
@@ -461,6 +467,12 @@ public final class MainActivity extends Activity implements TunnelHost {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_SCAN_INVITATION) {
+            if (resultCode == RESULT_OK && data != null) {
+                acceptScannedInvitation(data.getStringExtra(ScanInvitationActivity.EXTRA_INVITATION));
+            }
+            return;
+        }
         if (requestCode != REQUEST_CONSENT) {
             return;
         }
@@ -537,9 +549,19 @@ public final class MainActivity extends Activity implements TunnelHost {
             invitation.setGravity(Gravity.TOP | Gravity.START);
             content.addView(invitation, UiKit.matchWrap());
 
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            if (ScanInvitationActivity.hasCamera(this)) {
+                Button scan = ui.secondaryButton("Scan QR code");
+                scan.setOnClickListener(view -> startActivityForResult(
+                        new Intent(this, ScanInvitationActivity.class),
+                        REQUEST_SCAN_INVITATION));
+                actions.addView(scan, UiKit.weightedWrap());
+            }
             Button paste = ui.secondaryButton("Paste invitation");
             paste.setOnClickListener(view -> pasteInvitation(invitation));
-            content.addView(paste, ui.topSpaced());
+            actions.addView(paste, UiKit.weightedWrap());
+            content.addView(actions, ui.topSpaced());
 
             deviceName.setHint("Device name");
             deviceName.setText(Build.MODEL);
@@ -556,6 +578,14 @@ public final class MainActivity extends Activity implements TunnelHost {
                 .setNeutralButton(hasDraft ? "Discard pending" : null, null)
                 .setPositiveButton(hasDraft ? "Resume" : "Import", null)
                 .create();
+        importDialog = dialog;
+        importInvitationField = hasDraft ? null : invitation;
+        dialog.setOnDismissListener(ignored -> {
+            if (importDialog == dialog) {
+                importDialog = null;
+                importInvitationField = null;
+            }
+        });
         dialog.setOnShowListener(ignored -> {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
                 String invitationText = invitation.getText().toString().trim();
@@ -905,6 +935,18 @@ public final class MainActivity extends Activity implements TunnelHost {
             invitation = intent.getStringExtra(Intent.EXTRA_TEXT);
         }
         if (invitation != null && invitation.trim().startsWith("queqiao://")) {
+            showImportDialog(invitation.trim());
+        }
+    }
+
+    private void acceptScannedInvitation(String invitation) {
+        if (invitation == null || invitation.isBlank()) {
+            return;
+        }
+        if (importDialog != null && importDialog.isShowing() && importInvitationField != null) {
+            importInvitationField.setText(invitation.trim());
+            importInvitationField.setError(null);
+        } else {
             showImportDialog(invitation.trim());
         }
     }
