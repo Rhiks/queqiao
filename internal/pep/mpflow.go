@@ -74,13 +74,7 @@ const (
 	// can be delivered. This grace lets a healthy final ACK arrive, but bounds
 	// retention when the peer closes its last lane at exactly that point.
 	flowCompletionGrace = 5 * time.Second
-	// A local EOF is ambiguous between TCP half-close and full application
-	// close. Escalate only after response traffic stops making progress, or
-	// after the peer has acknowledged the local FIN; interactive sessions get
-	// more time for legitimate quiet periods.
-	flowAbortGrace        = 5 * time.Second
-	interactiveAbortGrace = 30 * time.Second
-	remoteFinDrainGrace   = 500 * time.Millisecond
+	remoteFinDrainGrace = 500 * time.Millisecond
 	// Once the peer FIN has proved the receive sequence complete, do not spend
 	// the full lane-replacement window trying to deliver its final ACK. If the
 	// local direction is also closing, the server completion tombstone can
@@ -335,8 +329,7 @@ type multipathFlow struct {
 	// behaviour under measurement is deterministic.
 	stallWatchdogDisabled bool
 	// stallScan and stallGrace are zero in production. Tests shorten them so
-	// the watchdog can be exercised without sleeping for seconds, the same
-	// pattern as abortGrace above.
+	// the watchdog can be exercised without sleeping for seconds.
 	stallScan  time.Duration
 	stallGrace time.Duration
 	// controlLaneShared reports whether another flow is currently using the
@@ -345,10 +338,7 @@ type multipathFlow struct {
 	controlLaneShared func() bool
 	started           time.Time
 	completionGrace   time.Duration
-	// abortGrace and abortDrainGrace are zero in production. Tests shorten
-	// the two independently so the inactivity and bounded-drain state machine
-	// can be exercised without sleeping for seconds.
-	abortGrace      time.Duration
+	// Tests shorten the bounded drain after a proven application close.
 	abortDrainGrace time.Duration
 	bytesUp         atomic.Uint64
 	bytesDown       atomic.Uint64
@@ -694,16 +684,6 @@ func (f *multipathFlow) snapshot() flowSnapshot {
 		Bytes: bytesUp + bytesDown, BytesUp: bytesUp, BytesDown: bytesDown, Elapsed: time.Since(f.started),
 		BaselineRTT: time.Duration(f.baselineRTTNS.Load()), CurrentRTT: time.Duration(f.currentRTTNS.Load()),
 	}
-}
-
-func (f *multipathFlow) localAbortGrace() time.Duration {
-	if f.abortGrace > 0 {
-		return f.abortGrace
-	}
-	if classifier.Class(f.class.Load()) == classifier.ClassInteractive {
-		return interactiveAbortGrace
-	}
-	return flowAbortGrace
 }
 
 func (f *multipathFlow) localAbortDrainGrace() time.Duration {
@@ -2648,12 +2628,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 		}
 		f.observe(len(out), false)
 		f.bytesDown.Add(uint64(len(out)))
-		if f.localClosed.Load() {
-			// A successful write proves that the application kept its receive
-			// half open. Measure the grace from the last such proof, not from
-			// the original EOF.
-			resetAbortTimer(f.localAbortGrace())
-		}
+
 		return nil
 	}
 	defer func() {
@@ -2661,20 +2636,10 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 			abortTimer.Stop()
 		}
 	}()
-	// EOF is published by flowSource. It cannot by itself arm the timer: TCP
-	// presents CloseWrite and Close identically, so a quiet local EOF may be a
-	// legitimate half-close. Buffered response data, a successful response
-	// write, or the peer's final ACK supplies the additional evidence that
-	// makes a bounded response-side grace appropriate.
-	localClosedC := f.localClosedCh
+	// Only a failed application write proves that the receive half is closed.
 	sendDoneC := f.sendDone
 	for {
 		select {
-		case <-localClosedC:
-			localClosedC = nil
-			if reassembler.BufferedBytes() > 0 && abortTimer == nil {
-				resetAbortTimer(f.localAbortGrace())
-			}
 		case event := <-f.events:
 			frame := event.frame
 			if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID {
@@ -2693,11 +2658,6 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 					if err := deliverToInner(out); err != nil {
 						return err
 					}
-				} else if f.localClosed.Load() && reassembler.BufferedBytes() > 0 && abortTimer == nil {
-					// Transport data is arriving but an earlier gap prevents any
-					// write to the application. This was the live leak: without a
-					// timer no operation remained that could discover its close.
-					resetAbortTimer(f.localAbortGrace())
 				}
 				lastAckSequence = f.acknowledgeArrival(reassembler, lastAckSequence)
 				if closed {
@@ -2810,9 +2770,6 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 					if remoteFin {
 						return nil
 					}
-					if f.localClosed.Load() {
-						resetAbortTimer(f.localAbortGrace())
-					}
 				} else {
 					return errors.New("final acknowledgement sequence mismatch")
 				}
@@ -2846,24 +2803,9 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 				return errLocalApplicationClose
 			}
 		case <-abortTimerC:
-			if f.localAbortSent.Load() {
-				// The abort write received a bounded drain window. Do not let a
-				// missing final ACK recreate the permanent flow leak.
-				f.closeAll()
-				return errLocalApplicationClose
-			}
-			if err := startLocalAbort(); err != nil {
-				// run may currently be inside a bounded lane-replacement wait
-				// rather than selecting worker results. Closing done is the
-				// wake-up that makes this a real termination source.
-				f.closeAll()
-				return errLocalApplicationClose
-			}
-			drainGrace := f.localAbortDrainGrace()
-			// Keep consuming acknowledgements briefly. A final ACK lets the
-			// scheduler release retained chunks cleanly; expiry is still a clean
-			// local cancellation and run will stop the sibling explicitly.
-			resetAbortTimer(drainGrace)
+			// A proven application close has exhausted its final ACK drain.
+			f.closeAll()
+			return errLocalApplicationClose
 		case <-ctx.Done():
 			return ctx.Err()
 		}

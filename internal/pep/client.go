@@ -271,6 +271,8 @@ type Client struct {
 	// handshake.
 	bulkMu    sync.Mutex
 	bulkConns []*bulkConn
+	bulkEpoch uint64
+	bulkDials map[*byte]context.CancelFunc
 
 	// pendingOpens admits only bounded remote setup work. It is deliberately
 	// non-blocking: callers beyond the bound are rejected promptly, release
@@ -782,6 +784,11 @@ func (c *Client) closeBulkQUICPool(reason string) {
 	c.bulkMu.Lock()
 	bulkConns := c.bulkConns
 	c.bulkConns = nil
+	c.bulkEpoch++
+	for _, cancel := range c.bulkDials {
+		cancel()
+	}
+	c.bulkDials = nil
 	c.bulkMu.Unlock()
 	for _, entry := range bulkConns {
 		entry.close(reason)
@@ -1755,23 +1762,34 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 			return entry, nil
 		}
 	}
-	if len(c.bulkConns) >= c.maxBulkConns() {
+	if len(c.bulkConns)+len(c.bulkDials) >= c.maxBulkConns() {
 		c.bulkMu.Unlock()
 		return nil, errBulkConnectionLimit
 	}
+	epoch := c.bulkEpoch
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if c.bulkDials == nil {
+		c.bulkDials = make(map[*byte]context.CancelFunc)
+	}
+	token := new(byte)
+	c.bulkDials[token] = cancel
 	c.bulkMu.Unlock()
 
-	// The handshake is deliberately performed without the pool mutex so that
-	// one slow secondary handshake cannot block every other lane join.
-	entry, err := c.dialBulkConn(ctx)
-	if err != nil {
-		return nil, err
-	}
+	entry, err := c.dialBulkConn(dialCtx)
 	c.bulkMu.Lock()
-	if len(c.bulkConns) >= c.maxBulkConns() {
+	if epoch == c.bulkEpoch {
+		delete(c.bulkDials, token)
+	}
+	if err != nil || epoch != c.bulkEpoch || dialCtx.Err() != nil {
 		c.bulkMu.Unlock()
-		entry.close("queqiao bulk pool limit reached")
-		return nil, errBulkConnectionLimit
+		if entry != nil {
+			entry.close("queqiao obsolete bulk dial")
+		}
+		if err != nil {
+			return nil, err
+		}
+		return nil, context.Canceled
 	}
 	entry.busy = true
 	c.bulkConns = append(c.bulkConns, entry)
@@ -1832,12 +1850,8 @@ func (s *controlPoolStreamConn) transportFailed(err error) {
 	if s.generation == nil {
 		return
 	}
-	// A QUIC connection can remain superficially open after one of its streams
-	// has stopped making progress. In that state Context().Err() is still nil,
-	// so keeping the generation makes every later flow reuse the same poisoned
-	// pool. A real I/O timeout is sufficient evidence to retire the generation;
-	// ordinary per-stream EOFs and application closes must not evict it.
-	if s.generation.conn.Context().Err() != nil || pooledTransportTimedOut(err) {
+	// A stream deadline is not evidence that its sibling streams have failed.
+	if s.generation.conn.Context().Err() != nil {
 		s.owner.retireControlQUICGeneration(s.generation, "queqiao pooled connection failed")
 	}
 }
