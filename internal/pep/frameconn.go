@@ -369,9 +369,13 @@ const frameWriteTimeout = 15 * time.Second
 // deadline; transports without that optional method retain their normal
 // behavior and are still interruptible by Close from the flow coordinator.
 func (c *frameConn) WriteContext(ctx context.Context, f protocol.Frame) error {
+	return c.writeContextMode(ctx, f, false)
+}
+
+func (c *frameConn) writeContextMode(ctx context.Context, f protocol.Frame, forceReliable bool) error {
 	ctx, cancel := context.WithTimeout(ctx, frameWriteTimeout)
 	defer cancel()
-	if c.bulkFrame(f) {
+	if !forceReliable && c.bulkFrame(f) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

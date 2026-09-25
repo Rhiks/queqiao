@@ -528,7 +528,7 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 	if sched := f.scheduler.Load(); sched != nil {
 		written = func() { sched.Wrote(lane.id, chunk) }
 	}
-	return f.enqueueFrameWritten(ctx, lane, frame, bulk, written)
+	return f.enqueueFrameWritten(ctx, lane, frame, bulk, written, chunk.Reliable)
 }
 
 // sendFinal closes the outbound direction once every byte has been

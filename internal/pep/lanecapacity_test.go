@@ -47,7 +47,7 @@ func TestCompleteLaneJoinMapsResetCodesToRetryPolicy(t *testing.T) {
 				}, Payload: session.ResetPayload(test.code, "refused")})
 			}()
 			client := &Client{cfg: ClientConfig{Logger: logger, HandshakeTimeout: 2 * time.Second}}
-			_, err := client.completeLaneJoin(&authenticatedLane{
+			_, err := client.completeLaneJoin(context.Background(), &authenticatedLane{
 				fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportQUIC, laneID: 1,
 			}, 7, 0)
 			if !errors.Is(err, test.want) {
