@@ -1466,7 +1466,6 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 }
 
 func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congestionConfig) (*controlQUICGeneration, error) {
-	c.checkSystemResume()
 	for {
 		// Never create a client-owned background dial on behalf of work that is
 		// already gone. This also closes the shutdown race where a waiter wakes
@@ -1475,6 +1474,7 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		c.checkSystemResume()
 		c.quicMu.Lock()
 		if generation := c.quicGeneration; generation != nil && generation.conn.Context().Err() == nil {
 			c.quicMu.Unlock()
@@ -1506,11 +1506,9 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 		if attempt.err != nil {
 			return nil, attempt.err
 		}
-		if attempt.generation != nil {
-			return attempt.generation, nil
-		}
 		// A path reset can supersede an in-flight dial. Its waiters retry against
 		// the new epoch instead of inheriting a connection bound to the old path.
+		// Recheck suspend time too: the waiter may have slept while dialing.
 	}
 }
 
