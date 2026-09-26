@@ -113,7 +113,7 @@ func (c *Client) currentUplinkIdentity() (string, bool) {
 		return "", unavailable
 	}
 	if iface := c.uplinkInterface(); iface != nil {
-		return fmt.Sprintf("%s|%s|%d|%s", address, iface.Name, iface.Index, uplinkGateway(iface.Index)), false
+		return fmt.Sprintf("%s|%s|%d|%s", address, iface.Name, iface.Index, uplinkGateway(iface.Index, address)), false
 	}
 	return address, false
 }

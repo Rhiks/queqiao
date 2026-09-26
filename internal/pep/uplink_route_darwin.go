@@ -3,6 +3,7 @@ package pep
 import (
 	"context"
 	"net"
+	"net/netip"
 	"os"
 	"sort"
 	"strings"
@@ -11,7 +12,28 @@ import (
 	"golang.org/x/net/route"
 )
 
-func defaultRouteGateway(m *route.RouteMessage) string {
+// The socket is bound to one address family. Churn in the other family
+// neither changes that socket's route nor invalidates its live connections.
+func sameUplinkFamily(source string, address route.Addr) bool {
+	ip, err := netip.ParseAddr(source)
+	if err != nil {
+		return true
+	}
+	switch address.(type) {
+	case *route.Inet4Addr:
+		return ip.Unmap().Is4()
+	case *route.Inet6Addr:
+		return ip.Is6() && !ip.Is4In6()
+	default:
+		return false
+	}
+}
+
+func uplinkAddressChanged(m *route.InterfaceAddrMessage, source string) bool {
+	return len(m.Addrs) > syscall.RTAX_IFA && sameUplinkFamily(source, m.Addrs[syscall.RTAX_IFA])
+}
+
+func defaultRouteGateway(m *route.RouteMessage, source string) string {
 	if m.Err != nil || len(m.Addrs) <= syscall.RTAX_GATEWAY {
 		return ""
 	}
@@ -22,7 +44,7 @@ func defaultRouteGateway(m *route.RouteMessage) string {
 	case *route.Inet6Addr:
 		zero = a.IP == [16]byte{}
 	}
-	if !zero {
+	if !zero || !sameUplinkFamily(source, m.Addrs[syscall.RTAX_DST]) {
 		return ""
 	}
 	switch a := m.Addrs[syscall.RTAX_GATEWAY].(type) {
@@ -34,7 +56,7 @@ func defaultRouteGateway(m *route.RouteMessage) string {
 	return ""
 }
 
-func uplinkGateway(index int) string {
+func uplinkGateway(index int, source string) string {
 	rib, err := route.FetchRIB(syscall.AF_UNSPEC, route.RIBTypeRoute, 0)
 	if err != nil {
 		return ""
@@ -47,7 +69,7 @@ func uplinkGateway(index int) string {
 	seen := make(map[string]bool)
 	for _, message := range messages {
 		if m, ok := message.(*route.RouteMessage); ok && m.Index == index {
-			if gateway := defaultRouteGateway(m); gateway != "" && !seen[gateway] {
+			if gateway := defaultRouteGateway(m, source); gateway != "" && !seen[gateway] {
 				seen[gateway] = true
 				gateways = append(gateways, gateway)
 			}
@@ -87,6 +109,7 @@ func (c *Client) uplinkEvents(ctx context.Context) <-chan struct{} {
 				continue
 			}
 			current := c.uplinkInterface()
+			source, _ := c.currentUplinkState()
 			matches := func(index int) bool {
 				return current != nil && current.Index == index || previous != nil && previous.Index == index
 			}
@@ -100,9 +123,9 @@ func (c *Client) uplinkEvents(ctx context.Context) <-chan struct{} {
 						flags[m.Index] = m.Flags
 					}
 				case *route.InterfaceAddrMessage:
-					relevant = matches(m.Index)
+					relevant = matches(m.Index) && uplinkAddressChanged(m, source)
 				case *route.RouteMessage:
-					relevant = matches(m.Index) && (m.Type == syscall.RTM_ADD || m.Type == syscall.RTM_DELETE || m.Type == syscall.RTM_CHANGE) && defaultRouteGateway(m) != "" && (c.cfg.LocalAddress == "" || m.Flags&syscall.RTF_IFSCOPE != 0)
+					relevant = matches(m.Index) && (m.Type == syscall.RTM_ADD || m.Type == syscall.RTM_DELETE || m.Type == syscall.RTM_CHANGE) && defaultRouteGateway(m, source) != "" && (c.cfg.LocalAddress == "" || m.Flags&syscall.RTF_IFSCOPE != 0)
 				}
 				if relevant {
 					notifyActivity(events)
