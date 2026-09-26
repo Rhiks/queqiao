@@ -347,8 +347,10 @@ func TestRound2InboundMemoryIsBoundedAndReleased(t *testing.T) {
 	f.memoryLimits.maxReceiveBytes = 8192
 	f.receiveMemory = memlimit.New(8192)
 	event := inboundEvent{frame: protocol.Frame{Header: protocol.Header{Type: protocol.TypeData}, Payload: make([]byte, 4096)}}
-	if !f.queueInbound(event) || !f.queueInbound(event) {
-		t.Fatal("available receive budget refused")
+	for range 2 {
+		if !f.queueInbound(event) {
+			t.Fatal("available receive budget refused")
+		}
 	}
 	if f.queueInbound(event) {
 		t.Fatal("receive budget exceeded")
