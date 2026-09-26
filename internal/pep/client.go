@@ -2555,7 +2555,8 @@ type rescueAttempt func(ctx context.Context) (*mpLane, error)
 // afterwards, because the round has just changed the state that request
 // described.
 func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) error {
-	if replacementID, ok := flow.rescueReplacement(); ok {
+	replacementID, replacing := flow.rescueReplacement()
+	if replacing {
 		ctx = context.WithValue(ctx, laneReplacementContextKey{}, laneReplacementHint{id: replacementID})
 	}
 	flow.rescueInFlight.Store(true)
@@ -2571,7 +2572,13 @@ func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessio
 		flow.resetLaneCapacityRefusals()
 	}
 	if err == nil {
-		flow.clearRescueReplacement()
+		if replacing {
+			// The peer retired this lane before acknowledging the JOIN. Mirror
+			// that transition locally instead of waiting for its old reader to
+			// time out and overwrite the next round's replacement identity.
+			flow.retireLaneByID(replacementID)
+			flow.clearRescueReplacementIf(replacementID)
+		}
 	}
 	select {
 	case <-flow.stallSignals():

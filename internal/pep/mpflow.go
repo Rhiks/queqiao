@@ -1924,7 +1924,8 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			episode = false
 			continue
 		}
-		if !episode {
+		newEpisode := !episode
+		if newEpisode {
 			episode = true
 			spare := f.suspectDataLanes()
 			if f.metrics != nil {
@@ -1948,6 +1949,12 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		// does not ask at all: the queued request would be answered by state
 		// the round is about to change.
 		if now.Sub(lastSignal) >= threshold && !f.rescueInFlight.Load() {
+			if !newEpisode {
+				// A completed JOIN changes the lane without necessarily making
+				// data progress. Refresh the identity on every subsequent round
+				// in this episode so the peer can replace the current lane.
+				f.suspectDataLanes()
+			}
 			select {
 			case f.stallSignal <- struct{}{}:
 				lastSignal = now
@@ -1966,7 +1973,7 @@ func (f *multipathFlow) suspectDataLanes() bool {
 	if len(lanes) == 0 {
 		return false
 	}
-	data := f.dataLane(lanes)
+	data := f.dataLane(preferUnsuspectedLanes(lanes))
 	for _, lane := range data {
 		lane.suspected.Store(true)
 	}
