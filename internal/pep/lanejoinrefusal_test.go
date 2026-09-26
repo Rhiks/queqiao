@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -230,6 +231,41 @@ func TestLaneJoinRefusalCodesMatchPermanence(t *testing.T) {
 			}
 			if len(response.Payload) == 0 || session.ResetCode(response.Payload[0]) != test.code {
 				t.Fatalf("refusal payload = %v, want reset code %d", response.Payload, test.code)
+			}
+		})
+	}
+}
+
+func TestCompletedJoinReplayHonorsCancellation(t *testing.T) {
+	for _, consumed := range []int{0, 1, 2} {
+		t.Run(fmt.Sprint(consumed), func(t *testing.T) {
+			owner := identity.Principal{ProviderID: "p", AccountID: "a", DeviceID: "d"}
+			flow := newIsolationTestFlow(t, false)
+			flow.finSent.Store(true)
+			sf := newServerFlow(flow, owner, TransportTCP, 1)
+			sf.completed.Store(true)
+			server := &Server{cfg: ServerConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, sessions: map[[16]byte]*serverFlow{flow.sessionID: sf}, metrics: metrics.New()}
+			local, remote := net.Pipe()
+			defer local.Close()
+			defer remote.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				server.handleLaneJoinOpen(ctx, local, newFrameConn(local), owner, flow.sessionID, 1, protocol.Frame{Header: protocol.Header{FlowID: flow.flowID}})
+			}()
+			reader := newFrameConn(remote)
+			for range consumed {
+				if _, err := reader.Read(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(300 * time.Millisecond):
+				t.Fatal("completion replay ignored cancellation")
 			}
 		})
 	}

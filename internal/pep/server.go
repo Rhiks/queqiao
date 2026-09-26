@@ -1020,14 +1020,18 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
+	// One bounded write phase covers admission and replay, including completed
+	// sessions which have no live flow watchdog left to interrupt a stuck peer.
+	writeCtx, cancelWrite := context.WithTimeout(ctx, laneJoinAdmissionTimeout)
+	defer cancelWrite()
 	if serverSession.completed.Load() {
 		s.cfg.Logger.Debug("lane join reached a completed session", "lane", laneID)
-		if err := fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}); err != nil {
+		if err := fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}); err != nil {
 			return
 		}
 		// The completed server flow has already acknowledged the peer's FIN;
 		// repeat that ACK on this authenticated replacement lane.
-		_ = fc.Write(protocol.Frame{Header: protocol.Header{
+		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
 			Version: protocol.Version, Type: protocol.TypeAck, Flags: protocol.FlagAckFinal | serverSession.flow.recvAckFlag,
 			SessionID: sessionID, FlowID: open.Header.FlowID, Sequence: serverSession.flow.remoteFinSequence.Load(),
 			Class: protocol.ClassBulk,
@@ -1044,7 +1048,7 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 			if serverSession.flow.localAbortSent.Load() {
 				flags |= protocol.FlagCloseAbort
 			}
-			_ = fc.Write(protocol.Frame{Header: protocol.Header{
+			_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
 				Version: protocol.Version, Type: protocol.TypeClose, Flags: flags,
 				SessionID: sessionID, FlowID: open.Header.FlowID, Sequence: serverSession.flow.finSequence.Load(),
 				Class: protocol.ClassBulk,
@@ -1085,9 +1089,7 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 	// holds the lane's write mutex while it arms the deadline, so a concurrent
 	// control write neither misses nor keeps it.
 	openOK := protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}
-	writeCtx, cancelWrite := context.WithTimeout(ctx, laneJoinAdmissionTimeout)
 	writeErr := fc.WriteContext(writeCtx, openOK)
-	cancelWrite()
 	if writeErr != nil {
 		serverSession.flow.removeLane(replacement)
 		return
@@ -1107,7 +1109,7 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 	// idempotent at the reassembler and cumulative-ACK state, so replaying them
 	// is safe even when the original frame was merely delayed.
 	if serverSession.flow.remoteFinSeen.Load() {
-		_ = fc.Write(protocol.Frame{Header: protocol.Header{
+		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
 			Version: protocol.Version, Type: protocol.TypeAck,
 			Flags:     protocol.FlagAckFinal | serverSession.flow.recvAckFlag,
 			SessionID: sessionID, FlowID: open.Header.FlowID,
@@ -1119,12 +1121,13 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 		if serverSession.flow.localAbortSent.Load() {
 			flags |= protocol.FlagCloseAbort
 		}
-		_ = fc.Write(protocol.Frame{Header: protocol.Header{
+		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
 			Version: protocol.Version, Type: protocol.TypeClose, Flags: flags,
 			SessionID: sessionID, FlowID: open.Header.FlowID,
 			Sequence: serverSession.flow.finSequence.Load(), Class: protocol.ClassBulk,
 		}})
 	}
+	cancelWrite()
 	select {
 	case <-serverSession.flow.doneChan():
 	case <-ctx.Done():
