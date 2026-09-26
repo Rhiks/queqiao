@@ -1399,6 +1399,13 @@ func encodeLaneID(laneID uint64) []byte {
 	return payload[:]
 }
 
+func encodeLaneReplacement(laneID, replacedLaneID uint64) []byte {
+	var payload [16]byte
+	binary.BigEndian.PutUint64(payload[:8], laneID)
+	binary.BigEndian.PutUint64(payload[8:], replacedLaneID)
+	return payload[:]
+}
+
 func (c *Client) dialAuthenticatedLane(ctx context.Context, kind TransportKind) (*authenticatedLane, error) {
 	sessionID, err := session.NewSessionID()
 	if err != nil {
@@ -1673,10 +1680,15 @@ func (c *Client) openControlPoolJoinLane(ctx context.Context, sessionID [16]byte
 func (c *Client) completeLaneJoin(ctx context.Context, lane *authenticatedLane, flowID uint64, flags uint16) (*mpLane, error) {
 	_, finishHandshake := bindHandshake(ctx, lane.outer, handshakeBound(lane.outer, c.cfg.HandshakeTimeout))
 	defer finishHandshake()
+	payload := encodeLaneID(lane.laneID)
+	if hint, ok := ctx.Value(laneReplacementContextKey{}).(laneReplacementHint); ok {
+		flags |= protocol.FlagReplaceLane
+		payload = encodeLaneReplacement(lane.laneID, hint.id)
+	}
 	if err := lane.fc.Write(protocol.Frame{Header: protocol.Header{
 		Version: protocol.Version, Type: protocol.TypeJoin, Flags: flags,
 		SessionID: lane.sessionID, FlowID: flowID, Class: protocol.ClassBulk,
-	}, Payload: encodeLaneID(lane.laneID)}); err != nil {
+	}, Payload: payload}); err != nil {
 		_ = lane.fc.Close()
 		return nil, err
 	}
@@ -2543,6 +2555,9 @@ type rescueAttempt func(ctx context.Context) (*mpLane, error)
 // afterwards, because the round has just changed the state that request
 // described.
 func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) error {
+	if replacementID, ok := flow.rescueReplacement(); ok {
+		ctx = context.WithValue(ctx, laneReplacementContextKey{}, laneReplacementHint{id: replacementID})
+	}
 	flow.rescueInFlight.Store(true)
 	err := c.openParallelRescue(ctx, flow, sessionID, flowID)
 	flow.rescueInFlight.Store(false)
@@ -2555,12 +2570,19 @@ func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessio
 	} else {
 		flow.resetLaneCapacityRefusals()
 	}
+	if err == nil {
+		flow.clearRescueReplacement()
+	}
 	select {
 	case <-flow.stallSignals():
 	default:
 	}
 	return err
 }
+
+type laneReplacementHint struct{ id uint64 }
+
+type laneReplacementContextKey struct{}
 
 func (c *Client) openParallelRescue(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) error {
 	// As in openRecoveryLane: a completed flow must not keep dialing. Only

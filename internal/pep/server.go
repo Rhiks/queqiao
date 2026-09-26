@@ -174,6 +174,10 @@ var (
 )
 
 func (s *serverFlow) addLane(lane *mpLane) error {
+	return s.addLaneReplacing(lane, 0, false)
+}
+
+func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, replaceLane bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.tcpMode && lane.kind != TransportTCP {
@@ -186,6 +190,14 @@ func (s *serverFlow) addLane(lane *mpLane) error {
 		s.flow.retireLanesExcept(TransportTCP)
 		s.tcpMode = true
 		s.maxLanes = s.tcpMaxLanes
+	}
+	if replaceLane && replacedLaneID != lane.id {
+		// The replacement hint is authenticated by the existing session and
+		// principal. Retire exactly the named old lane before applying the
+		// normal ceiling, so parallel rescue losers still see the newly admitted
+		// winner as a young protected lane and are refused instead of evicting
+		// it.
+		s.flow.retireLaneByID(replacedLaneID)
 	}
 	if s.flow.laneCount() >= s.maxLanes {
 		// The peer can detect a dead QUIC socket before this endpoint does
@@ -744,16 +756,22 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		return
 	}
 	if open.Header.Type == protocol.TypeJoin {
-		if session.IsZeroSessionID(open.Header.SessionID) || open.Header.FlowID == 0 || open.Header.Sequence != 0 || open.Header.Flags&^protocol.FlagReserveControl != 0 || len(open.Payload) != 8 {
+		validJoinFlags := protocol.FlagReserveControl | protocol.FlagReplaceLane
+		if session.IsZeroSessionID(open.Header.SessionID) || open.Header.FlowID == 0 || open.Header.Sequence != 0 || open.Header.Flags&^validJoinFlags != 0 || len(open.Payload) != 8 && len(open.Payload) != 16 || len(open.Payload) == 16 && open.Header.Flags&protocol.FlagReplaceLane == 0 || len(open.Payload) == 8 && open.Header.Flags&protocol.FlagReplaceLane != 0 {
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: open.Header.SessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}, Payload: session.ResetPayload(session.ResetProtocol, "invalid lane join")})
 			return
 		}
 		laneID := binary.BigEndian.Uint64(open.Payload)
+		replaceLane := open.Header.Flags&protocol.FlagReplaceLane != 0
+		replacedLaneID := uint64(0)
+		if replaceLane {
+			replacedLaneID = binary.BigEndian.Uint64(open.Payload[8:])
+		}
 		if laneID == 0 {
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: open.Header.SessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}, Payload: session.ResetPayload(session.ResetProtocol, "invalid lane join")})
 			return
 		}
-		s.handleLaneJoinOpen(ctx, conn, fc, principal, open.Header.SessionID, laneID, open)
+		s.handleLaneJoinOpenWithReplacement(ctx, conn, fc, principal, open.Header.SessionID, laneID, replacedLaneID, replaceLane, open)
 		return
 	}
 	sessionID := open.Header.SessionID
@@ -982,6 +1000,10 @@ func (s *Server) refuseLaneJoin(fc *frameConn, sessionID [16]byte, flowID, laneI
 // additionally binds the new lane to the principal that created the session;
 // session and flow IDs are routing identifiers, never bearer credentials.
 func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, laneID uint64, open protocol.Frame) {
+	s.handleLaneJoinOpenWithReplacement(ctx, conn, fc, principal, sessionID, laneID, 0, false, open)
+}
+
+func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, laneID, replacedLaneID uint64, replaceLane bool, open protocol.Frame) {
 	if session.IsZeroSessionID(sessionID) || laneID == 0 || open.Header.FlowID == 0 {
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinInvalidIdentity, session.ResetProtocol, "invalid lane join identity")
 		return
@@ -1060,7 +1082,7 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 		id: laneID, kind: kind, fc: fc, writeHook: s.cfg.testLaneWriteHook,
 		control: controlReplacement, staged: true,
 	}
-	if err := serverSession.addLane(replacement); err != nil {
+	if err := serverSession.addLaneReplacing(replacement, replacedLaneID, replaceLane); err != nil {
 		s.cfg.Logger.Debug("lane join admission refused", "lane", laneID, "error", err)
 		switch {
 		case errors.Is(err, errLaneFlowTCPMode):

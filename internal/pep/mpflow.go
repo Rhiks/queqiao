@@ -333,6 +333,11 @@ type multipathFlow struct {
 	// moment the first one returns, before its fresh lane had any chance to
 	// prove itself.
 	rescueInFlight atomic.Bool
+	// rescueReplacementID is the physical lane the next rescue JOIN should
+	// replace on the peer. The separate bit keeps lane zero representable: a
+	// zero ID is a real initial lane, not the absence of a replacement hint.
+	rescueReplacementID    atomic.Uint64
+	rescueReplacementValid atomic.Bool
 	// stallWatchdogDisabled turns the watchdog goroutine off entirely. Zero
 	// in production; tests that pin exact dial counts set it so recovery
 	// behaviour under measurement is deterministic.
@@ -913,6 +918,9 @@ func (f *multipathFlow) retireOldestLane(control bool, minAge time.Duration) boo
 	delete(f.lanes, victim.id)
 	victim.closed.Store(true)
 	f.lanesMu.Unlock()
+	if sched := f.scheduler.Load(); sched != nil {
+		sched.RetireLane(victim.id)
+	}
 	if victim.fc != nil {
 		_ = victim.fc.Close()
 	}
@@ -934,6 +942,54 @@ func (f *multipathFlow) removeLane(lane *mpLane) {
 	f.lanesMu.Unlock()
 	if lane.fc != nil {
 		_ = lane.fc.Close()
+	}
+}
+
+// retireLaneByID withdraws one live lane before a replacement JOIN is
+// admitted. Removing it from the flow map and scheduler is one transition:
+// leaving either copy behind lets a replacement appear healthy while the
+// sender still offers work to the old socket.
+func (f *multipathFlow) retireLaneByID(id uint64) bool {
+	f.lanesMu.Lock()
+	lane := f.lanes[id]
+	if lane == nil || lane.closed.Load() {
+		if lane != nil {
+			delete(f.lanes, id)
+		}
+		f.lanesMu.Unlock()
+		return false
+	}
+	delete(f.lanes, id)
+	lane.closed.Store(true)
+	f.lanesMu.Unlock()
+	if sched := f.scheduler.Load(); sched != nil {
+		sched.RetireLane(lane.id)
+	}
+	if lane.fc != nil {
+		_ = lane.fc.Close()
+	}
+	return true
+}
+
+func (f *multipathFlow) setRescueReplacement(id uint64) {
+	f.rescueReplacementID.Store(id)
+	f.rescueReplacementValid.Store(true)
+}
+
+func (f *multipathFlow) rescueReplacement() (uint64, bool) {
+	if !f.rescueReplacementValid.Load() {
+		return 0, false
+	}
+	return f.rescueReplacementID.Load(), true
+}
+
+func (f *multipathFlow) clearRescueReplacement() {
+	f.rescueReplacementValid.Store(false)
+}
+
+func (f *multipathFlow) clearRescueReplacementIf(id uint64) {
+	if f.rescueReplacementValid.Load() && f.rescueReplacementID.Load() == id {
+		f.rescueReplacementValid.Store(false)
 	}
 }
 
@@ -989,6 +1045,9 @@ func (f *multipathFlow) retireLeastProductiveLane() bool {
 	delete(f.lanes, victim.id)
 	victim.closed.Store(true)
 	f.lanesMu.Unlock()
+	if sched := f.scheduler.Load(); sched != nil {
+		sched.RetireLane(victim.id)
+	}
 	if victim.fc != nil {
 		_ = victim.fc.Close()
 	}
@@ -1206,6 +1265,12 @@ func (f *multipathFlow) closeFailedLane(lane *mpLane) bool {
 	if lane == nil || !lane.closed.CompareAndSwap(false, true) {
 		return false
 	}
+	f.setRescueReplacement(lane.id)
+	f.lanesMu.Lock()
+	if f.lanes[lane.id] == lane {
+		delete(f.lanes, lane.id)
+	}
+	f.lanesMu.Unlock()
 	if lane.fc != nil {
 		_ = lane.fc.Close()
 	}
@@ -1901,8 +1966,14 @@ func (f *multipathFlow) suspectDataLanes() bool {
 	if len(lanes) == 0 {
 		return false
 	}
-	for _, lane := range f.dataLane(lanes) {
+	data := f.dataLane(lanes)
+	for _, lane := range data {
 		lane.suspected.Store(true)
+	}
+	if len(data) > 0 {
+		// QUIC has one data lane. Keeping the explicit identity also makes a
+		// zero-numbered initial lane unambiguous to the replacement JOIN.
+		f.setRescueReplacement(data[0].id)
 	}
 	for _, lane := range f.healthyLanes() {
 		if !lane.suspected.Load() {
@@ -2636,6 +2707,7 @@ func (f *multipathFlow) receiveACK(event inboundEvent) error {
 	}
 	if clearSuspicion && event.lane != nil {
 		event.lane.suspected.Store(false)
+		f.clearRescueReplacementIf(event.lane.id)
 	}
 	if frame.Header.Flags&protocol.FlagAckFinal == 0 {
 		if err := f.acknowledgeReplay(frame.Header.Sequence, false); err != nil {

@@ -73,6 +73,11 @@ const (
 	// OPEN, lane zero begins in that role. On JOIN, the new lane replaces that
 	// role after a pooled connection generation has expired.
 	FlagReserveControl uint16 = 1 << 5
+	// FlagReplaceLane marks a JOIN as an explicit replacement for the lane ID
+	// encoded after the new lane ID in its payload. The peer can retire the
+	// old lane before applying the admission ceiling, so a stalled lane does
+	// not have to remain half-open until the transport idle timeout.
+	FlagReplaceLane uint16 = 1 << 6
 	// FlagAckRanges is valid only on ACK. The payload carries byte ranges the
 	// receiver already holds out of order, beyond the cumulative sequence.
 	//
@@ -81,7 +86,7 @@ const (
 	// its retention window has to cover the whole reorder span. Protocol v1
 	// requires both peers to understand it.
 	FlagAckRanges uint16 = 1 << 7
-	knownFlags           = FlagFin | FlagAckFinal | FlagAckUp | FlagAckDown | FlagCloseAbort | FlagReserveControl | FlagAckRanges
+	knownFlags           = FlagFin | FlagAckFinal | FlagAckUp | FlagAckDown | FlagCloseAbort | FlagReserveControl | FlagReplaceLane | FlagAckRanges
 )
 
 type Type byte
@@ -90,7 +95,8 @@ const (
 	TypeOpen Type = iota + 1
 	TypeOpenOK
 	// TypeJoin attaches an independently mutually authenticated lane to an
-	// existing flow. Its payload is exactly one non-zero big-endian lane ID.
+	// existing flow. Its payload is one non-zero big-endian lane ID, or that ID
+	// followed by the lane ID it explicitly replaces when FlagReplaceLane is set.
 	TypeJoin
 	TypeData
 	TypeAck
@@ -148,6 +154,10 @@ func (e UnsupportedVersionError) Error() string {
 
 func reserveControlFlagValid(t Type, flags uint16) bool {
 	return flags&FlagReserveControl == 0 || t == TypeOpen || t == TypeJoin
+}
+
+func replaceLaneFlagValid(t Type, flags uint16) bool {
+	return flags&FlagReplaceLane == 0 || t == TypeJoin
 }
 
 func ackRangesFlagValid(t Type, flags uint16) bool {
@@ -209,7 +219,7 @@ func (h Header) Encode(dst []byte) error {
 	if len(dst) < HeaderSize {
 		return io.ErrShortBuffer
 	}
-	if h.Version != Version || !h.Type.valid() || h.Class > ClassBulk || h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
+	if h.Version != Version || !h.Type.valid() || h.Class > ClassBulk || h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !replaceLaneFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
 		return errors.New("invalid frame header")
 	}
 	if h.PayloadLen > MaxPayload {
@@ -233,7 +243,7 @@ func (h Header) Validate() error {
 	if h.Version != Version || !h.Type.valid() || h.Class > ClassBulk {
 		return errors.New("invalid frame header")
 	}
-	if h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
+	if h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !replaceLaneFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
 		return errors.New("unknown frame flags")
 	}
 	if h.PayloadLen > MaxPayload {
