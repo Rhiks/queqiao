@@ -1766,6 +1766,9 @@ func (c *Client) openBulkPoolStream(ctx context.Context) (streamConn, error) {
 // reserveBulkConn returns an idle authenticated connection, or establishes a
 // new one when every existing connection is already carrying a lane.
 func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.checkSystemResume()
 	c.bulkMu.Lock()
 	live := c.bulkConns[:0]
@@ -1803,6 +1806,9 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 	c.bulkMu.Unlock()
 
 	entry, err := c.dialBulkConn(dialCtx)
+	// A successful handshake can span system sleep. Expire its old epoch
+	// before publishing it, just as control-pool borrowers do after dialing.
+	c.checkSystemResume()
 	c.bulkMu.Lock()
 	if epoch == c.bulkEpoch {
 		delete(c.bulkDials, token)

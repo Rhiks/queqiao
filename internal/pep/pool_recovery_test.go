@@ -581,3 +581,36 @@ func assertEchoRoundTrip(t *testing.T, conn net.Conn, payload string) {
 		t.Fatalf("echo = %q, want %q", got, payload)
 	}
 }
+
+// Sleep may happen during the handshake, after the initial resume check.
+// Do not publish that pre-sleep bulk connection into the post-wake pool.
+func TestBulkDialRechecksResumeBeforePublishing(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	client := rig.client
+	t.Cleanup(client.closeQUICPool)
+	var reads atomic.Int64
+	client.resumeState = suspendWatchState{known: true}
+	client.readSuspendTime = func() (time.Duration, error) {
+		if reads.Add(1) == 1 {
+			return 0, nil
+		}
+		return laneDeadPathDetection + time.Second, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entry, err := client.reserveBulkConn(ctx)
+	if entry != nil {
+		client.releaseBulkConn(entry, true)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-sleep bulk dial published: %v", err)
+	}
+	if got := client.bulkConnCount(); got != 0 {
+		t.Fatalf("obsolete bulk connections: %d", got)
+	}
+	fresh, err := client.reserveBulkConn(ctx)
+	if err != nil {
+		t.Fatalf("fresh bulk dial after resume: %v", err)
+	}
+	client.releaseBulkConn(fresh, true)
+}
