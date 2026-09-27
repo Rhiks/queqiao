@@ -311,19 +311,16 @@ func (c *frameConn) countData(f protocol.Frame, coded bool) {
 
 func (c *frameConn) Write(f protocol.Frame) error {
 	if c.bulkFrame(f) {
-		c.countData(f, true)
 		if err := c.writeCoded(context.Background(), f); err != nil {
 			return err
 		}
 		if c.needsOpenSafetyCopy(f) {
-			c.countData(f, false)
 			c.writeMu <- struct{}{}
 			defer func() { <-c.writeMu }()
 			return c.writeLocked(f)
 		}
 		return nil
 	}
-	c.countData(f, false)
 	c.writeMu <- struct{}{}
 	defer func() { <-c.writeMu }()
 	return c.writeLocked(f)
@@ -340,6 +337,7 @@ func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame) error {
 	if err := c.bulk.SendContext(ctx, buf); err != nil {
 		return c.writeControlContext(ctx, f)
 	}
+	c.countData(f, true)
 	return nil
 }
 
@@ -359,7 +357,11 @@ func (c *frameConn) writeLocked(f protocol.Frame) error {
 	if cap(buf) <= writeBufferRetain {
 		c.writeBuf = buf
 	}
-	return writeFull(c.control, buf)
+	if err := writeFull(c.control, buf); err != nil {
+		return err
+	}
+	c.countData(f, false)
+	return nil
 }
 
 const frameWriteTimeout = 15 * time.Second
@@ -379,17 +381,14 @@ func (c *frameConn) writeContextMode(ctx context.Context, f protocol.Frame, forc
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		c.countData(f, true)
 		if err := c.writeCoded(ctx, f); err != nil {
 			return err
 		}
 		if !c.needsOpenSafetyCopy(f) {
 			return nil
 		}
-		c.countData(f, false)
 		return c.writeControlContext(ctx, f)
 	}
-	c.countData(f, false)
 	return c.writeControlContext(ctx, f)
 }
 

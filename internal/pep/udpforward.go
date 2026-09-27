@@ -19,17 +19,18 @@ type udpForwardPacket struct {
 	queued  time.Time
 }
 type udpForwarder struct {
-	ctx     context.Context
-	conn    *net.UDPConn
-	resolve func(context.Context, string) ([]*net.UDPAddr, error)
-	sent    func(int)
-	mu      sync.Mutex
-	targets map[string]chan udpForwardPacket
-	wg      sync.WaitGroup
+	ctx       context.Context
+	conn      *net.UDPConn
+	writeGate chan struct{}
+	resolve   func(context.Context, string) ([]*net.UDPAddr, error)
+	sent      func(int)
+	mu        sync.Mutex
+	targets   map[string]chan udpForwardPacket
+	wg        sync.WaitGroup
 }
 
 func newUDPForwarder(ctx context.Context, conn *net.UDPConn, resolve func(context.Context, string) ([]*net.UDPAddr, error), sent func(int)) *udpForwarder {
-	return &udpForwarder{ctx: ctx, conn: conn, resolve: resolve, sent: sent, targets: make(map[string]chan udpForwardPacket)}
+	return &udpForwarder{ctx: ctx, conn: conn, writeGate: make(chan struct{}, 1), resolve: resolve, sent: sent, targets: make(map[string]chan udpForwardPacket)}
 }
 
 func (f *udpForwarder) enqueue(destination string, payload []byte) bool {
@@ -114,12 +115,48 @@ func (f *udpForwarder) run(destination string, queue chan udpForwardPacket) {
 				continue
 			}
 			for _, address := range addresses {
-				_ = f.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if _, err := f.conn.WriteToUDP(packet.payload, address); err == nil {
+				if err := f.writePacket(packet, address); err == nil {
 					f.sent(len(packet.payload))
 					break
 				}
 			}
 		}
 	}
+}
+
+// The association shares one socket across destination workers. Own both its
+// deadline and write until cancellation cleanup finishes, so another worker
+// cannot extend a blocked write or inherit an expired deadline.
+func (f *udpForwarder) writePacket(packet udpForwardPacket, address *net.UDPAddr) error {
+	deadline := time.Now().Add(5 * time.Second)
+	if expires := packet.queued.Add(udpForwardPacketAge); expires.Before(deadline) {
+		deadline = expires
+	}
+	ctx, cancel := context.WithDeadline(f.ctx, deadline)
+	defer cancel()
+	select {
+	case f.writeGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-f.writeGate }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := f.conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	finished := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = f.conn.SetWriteDeadline(time.Now())
+		close(finished)
+	})
+	defer func() {
+		if !stop() {
+			<-finished
+		}
+		_ = f.conn.SetWriteDeadline(time.Time{})
+	}()
+	_, err := f.conn.WriteToUDP(packet.payload, address)
+	return err
 }
