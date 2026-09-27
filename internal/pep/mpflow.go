@@ -2349,31 +2349,38 @@ func (f *multipathFlow) extendReplacementOutage(now time.Time, grace time.Durati
 }
 
 func (f *multipathFlow) acknowledgeReplay(sequence uint64, final bool) error {
+	_, err := f.acknowledgeCoverage(sequence, final, nil)
+	return err
+}
+
+// Validate the complete acknowledgement before publishing any state. Holding
+// replayMu across both cumulative and selective updates serializes lane ACKs.
+func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges [][2]uint64) (bool, error) {
 	f.replayMu.Lock()
+	defer f.replayMu.Unlock()
 	if sequence > f.highestSent {
-		f.replayMu.Unlock()
-		return fmt.Errorf("acknowledgement %d exceeds sent sequence %d", sequence, f.highestSent)
+		return false, fmt.Errorf("acknowledgement %d exceeds sent sequence %d", sequence, f.highestSent)
 	}
-	if sequence < f.acked {
-		f.replayMu.Unlock()
-		return nil // delayed ACK from a slower lane
+	for _, r := range ranges {
+		if r[1] > f.highestSent {
+			return false, errors.New("acknowledgement range exceeds sent sequence")
+		}
 	}
 	advanced := sequence > f.acked
-	f.acked = sequence
+	if advanced {
+		f.acked = sequence
+	}
 	if f.ackTrack != nil {
 		f.ackTrack.Advance(sequence)
+		advanced = f.ackTrack.Add(ranges) || advanced
 	}
 	if final && f.closeFrame != nil && f.closeFrame.Header.Sequence <= sequence {
 		f.closeFrame = nil
 	}
-	f.replayMu.Unlock()
 	if advanced {
-		// The acknowledged send offset is the most direct proof that this
-		// flow's bytes are reaching the peer: it only moves when the peer's
-		// receiver says so. It is the stall watchdog's send-side clock.
 		f.lastAckProgressNS.Store(time.Now().UnixNano())
 	}
-	return nil
+	return advanced, nil
 }
 
 // noteSent records that bytes have been written without retaining them.
@@ -2696,47 +2703,29 @@ func (f *multipathFlow) receiveACK(event inboundEvent) error {
 	if frame.Header.Flags&f.sendAckFlag == 0 {
 		return errors.New("acknowledgement has wrong direction")
 	}
-	// An acknowledgement carrying new delivery information --
-	// a cumulative point that moved, ranges, or the final ACK --
-	// and arriving on a suspected lane is direct proof the lane
-	// still round-trips: the peer received this flow's bytes and
-	// its answer travelled back on this lane. A bare duplicate
-	// proves nothing about delivery, so it does not clear the
-	// mark. Progress itself is recorded in acknowledgeReplay and
-	// the ranges branch below.
-	clearSuspicion := frame.Header.Flags&protocol.FlagAckFinal != 0 ||
-		frame.Header.Flags&protocol.FlagAckRanges != 0
-	if frame.Header.Flags&protocol.FlagAckFinal == 0 {
-		f.replayMu.Lock()
-		advances := frame.Header.Sequence > f.acked
-		f.replayMu.Unlock()
-		clearSuspicion = clearSuspicion || advances
+	final := frame.Header.Flags&protocol.FlagAckFinal != 0
+	var ranges [][2]uint64
+	if frame.Header.Flags&protocol.FlagAckRanges != 0 {
+		var err error
+		ranges, err = protocol.DecodeAckRanges(frame.Payload, frame.Header.Sequence)
+		if err != nil {
+			return fmt.Errorf("acknowledgement ranges: %w", err)
+		}
+	} else if len(frame.Payload) != 0 {
+		return errors.New("unexpected acknowledgement payload")
 	}
-	if clearSuspicion && event.lane != nil {
+	if final && frame.Header.Sequence != f.finSequence.Load() {
+		return errors.New("final acknowledgement sequence mismatch")
+	}
+	progress, err := f.acknowledgeCoverage(frame.Header.Sequence, final, ranges)
+	if err != nil {
+		return err
+	}
+	if progress && event.lane != nil {
 		event.lane.suspected.Store(false)
 		f.clearRescueReplacementIf(event.lane.id)
 	}
-	if frame.Header.Flags&protocol.FlagAckFinal == 0 {
-		if err := f.acknowledgeReplay(frame.Header.Sequence, false); err != nil {
-			return err
-		}
-		if frame.Header.Flags&protocol.FlagAckRanges != 0 {
-			ranges, err := protocol.DecodeAckRanges(frame.Payload, frame.Header.Sequence)
-			if err != nil {
-				return fmt.Errorf("acknowledgement ranges: %w", err)
-			}
-			f.ackTrack.Add(ranges)
-			// Ranges above the cumulative point are arrivals too:
-			// the peer has these bytes even though a gap stops
-			// the acknowledged offset from moving.
-			f.lastAckProgressNS.Store(time.Now().UnixNano())
-		}
-		return nil
-	}
-	if frame.Header.Sequence == f.finSequence.Load() {
-		if err := f.acknowledgeReplay(frame.Header.Sequence, true); err != nil {
-			return err
-		}
+	if final {
 		select {
 		case f.finalAck <- struct{}{}:
 		default:
@@ -2748,8 +2737,6 @@ func (f *multipathFlow) receiveACK(event inboundEvent) error {
 			// send.
 			return errLocalApplicationClose
 		}
-	} else {
-		return errors.New("final acknowledgement sequence mismatch")
 	}
 	return nil
 }
@@ -2944,6 +2931,9 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 			sendDoneC = nil
 			if f.localAbortSent.Load() {
 				return errLocalApplicationClose
+			}
+			if remoteFin {
+				return nil
 			}
 		case <-abortTimerC:
 			// A proven application close has exhausted its final ACK drain.
