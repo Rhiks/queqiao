@@ -239,6 +239,7 @@ type Client struct {
 	// can be tested without a network that loses things on demand.
 	openFlowForTest               func() (*openedFlow, error)
 	probeControlGenerationForTest func(context.Context, *controlQUICGeneration, time.Duration) error
+	probeBulkConnectionForTest    func(context.Context, *bulkConn, time.Duration) error
 	// openJoinLaneForTest controls handshake completion during manager shutdown.
 	openJoinLaneForTest func(context.Context, TransportKind, uint64) (*mpLane, error)
 	// flowOpenRetryDelayForTest makes retry timing deterministic without
@@ -377,6 +378,7 @@ type bulkConn struct {
 	busy       bool
 	idleTimer  *time.Timer // guarded by Client.bulkMu
 	idleEpoch  uint64      // guarded by Client.bulkMu
+	verified   time.Time   // guarded by Client.bulkMu; handshake or authenticated probe
 	closeOnce  sync.Once
 }
 
@@ -1795,6 +1797,10 @@ func (c *Client) openBulkPoolStream(ctx context.Context) (streamConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := c.verifyBulkPath(dialCtx, entry); err != nil {
+		c.releaseBulkConn(entry, true)
+		return nil, err
+	}
 	stream, err := entry.conn.OpenStreamSync(dialCtx)
 	if err != nil {
 		c.releaseBulkConn(entry, entry.conn.Context().Err() != nil)
@@ -1900,7 +1906,7 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	entry := &bulkConn{conn: conn, packet: packet}
+	entry := &bulkConn{conn: conn, packet: packet, verified: time.Now()}
 	entry.controller = configureQUICController(conn, congestionConfig{
 		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
 		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,

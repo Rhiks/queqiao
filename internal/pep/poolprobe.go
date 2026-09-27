@@ -5,9 +5,13 @@ import (
 	"errors"
 	"time"
 
+	"github.com/apernet/quic-go"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 )
+
+// Remote proof freshness is independent of the local interface polling cadence.
+const pooledPathProofMaxAge = 2 * time.Second
 
 // Borrowers share one round-trip check when the last real proof is stale.
 // Failure drains this generation: new borrowers get a fresh connection,
@@ -19,7 +23,7 @@ type controlPathProbe struct {
 
 func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration) error {
 	g.probeMu.Lock()
-	if time.Since(g.verified) < uplinkPollInterval {
+	if time.Since(g.verified) < pooledPathProofMaxAge {
 		g.probeMu.Unlock()
 		return nil
 	}
@@ -57,11 +61,15 @@ func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration
 }
 
 func probeControlGeneration(ctx context.Context, g *controlQUICGeneration, budget time.Duration) error {
-	stream, err := g.conn.OpenStreamSync(ctx)
+	return probePooledQUIC(ctx, g.conn, budget)
+}
+
+func probePooledQUIC(ctx context.Context, conn *quic.Conn, budget time.Duration) error {
+	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return err
 	}
-	outer := &quicStreamConn{stream: stream, conn: g.conn, closeConn: false}
+	outer := &quicStreamConn{stream: stream, conn: conn, closeConn: false}
 	defer outer.Close()
 	_, finish := bindHandshake(ctx, outer, budget)
 	defer finish()
@@ -109,4 +117,30 @@ func (g *controlQUICGeneration) releaseBorrow() {
 	if closeNow {
 		g.close("queqiao drained generation released")
 	}
+}
+
+// Bulk entries are exclusively reserved before validation. A failed check can
+// retire that entry without closing any control-pool sibling. No background
+// keepalive is introduced: idle entries are checked only when borrowed again.
+func (c *Client) verifyBulkPath(ctx context.Context, entry *bulkConn) error {
+	c.bulkMu.Lock()
+	fresh := time.Since(entry.verified) < pooledPathProofMaxAge
+	c.bulkMu.Unlock()
+	if fresh {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, c.cfg.HandshakeTimeout)
+	defer cancel()
+	var err error
+	if c.probeBulkConnectionForTest != nil {
+		err = c.probeBulkConnectionForTest(probeCtx, entry, c.cfg.HandshakeTimeout)
+	} else {
+		err = probePooledQUIC(probeCtx, entry.conn, c.cfg.HandshakeTimeout)
+	}
+	if err == nil {
+		c.bulkMu.Lock()
+		entry.verified = time.Now()
+		c.bulkMu.Unlock()
+	}
+	return err
 }

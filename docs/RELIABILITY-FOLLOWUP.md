@@ -33,3 +33,28 @@ background benchmark or periodic fault injector is installed.
 A release is not considered deployed merely because its source is pushed.
 Record actual running revisions and keep the currently selected user route
 available during any rollout.
+
+## Tokyo AI follow-up
+
+A later review identified a concrete asymmetry: an idle bulk-pool connection
+could be reused based only on its QUIC context, whereas control-pool reuse
+requires an authenticated round trip. Bulk reuse now shares the same probe
+implementation, with a separate remote-proof lifetime constant (the previous
+control lifetime is unchanged). New handshakes and recent successful probes
+skip another probe; expired entries are exclusively reserved before a bounded
+check. Failure removes only that entry, preserving shared control siblings.
+Focused tests cover failed-entry retirement, real probe success, hot reuse and
+sibling round trips. This does not claim an active-ACK lease fast path or a
+measured WAN latency improvement.
+
+The local operator's AI route uses the existing router's category data and a
+fixed Tokyo group. This deployment policy does not belong in generic transport
+source. No application TLS interception or AI request retry is introduced.
+The acknowledged-request idle watchdog regression already protects waiting
+applications; it is retained rather than adding an AI-specific timeout.
+
+Policer overdrive remains a known limitation, not a repaired defect. Changing
+the congestion controller, aggregate pacing or FEC policy requires evidence
+that the Tokyo workload encounters this bottleneck and a controlled comparison.
+The proposed new AI scheduler/profile and active-ACK pool lease remain deferred
+for the same reason. None are silently marked implemented.
