@@ -451,7 +451,7 @@ func dialTCP(ctx context.Context, remote string, credentials identity.ClientCred
 	tlsConn := conn.(*tls.Conn)
 	if tlsConn.ConnectionState().NegotiatedProtocol != defaultALPN {
 		_ = tlsConn.Close()
-		return nil, fmt.Errorf("gateway %q did not negotiate Queqiao protocol 1 over TCP; check that the endpoint and server version match", remote)
+		return nil, fmt.Errorf("gateway %q did not negotiate Queqiao protocol %d over TCP; check that the endpoint and server version match", remote, protocol.Version)
 	}
 	return tlsConn, nil
 }
@@ -890,7 +890,7 @@ func dialQUICAddress(dialCtx context.Context, remote string, remoteAddr *net.UDP
 
 func explainDataHandshakeError(remote, transport string, err error) error {
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no application protocol") {
-		return fmt.Errorf("gateway %q rejected Queqiao protocol 1 over %s; the endpoint may still run an incompatible development server or another TLS service: %w", remote, transport, err)
+		return fmt.Errorf("gateway %q rejected Queqiao protocol %d over %s; the endpoint may still run an incompatible development server or another TLS service: %w", remote, protocol.Version, transport, err)
 	}
 	return err
 }

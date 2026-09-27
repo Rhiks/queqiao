@@ -14,30 +14,30 @@ const (
 	// Version is the framing this build speaks, and the only thing that stops
 	// two builds that disagree from appearing to work.
 	//
-	// Version 1 is the first public wire contract. Earlier development wire
-	// numbers were never released. Every connection is authenticated by
+	// Version 2 adds explicit replacement JOINs. Version 1 peers must upgrade
+	// both endpoints before using this wire contract. Every connection is authenticated by
 	// provider-issued mutual TLS before a frame is accepted, and streams begin
 	// directly with OPEN or JOIN.
-	Version    = byte(1)
+	Version    = byte(2)
 	HeaderSize = 46
 	// DataALPN is the application protocol negotiated for the data plane. It
 	// carries the wire version because that is what makes the versioning
 	// fail-closed: there is no capability exchange to discover a disagreement
 	// after the fact, so two builds that speak different framing must fail to
 	// negotiate rather than connect and then misunderstand each other.
-	DataALPN = "queqiao/1"
-	// MaxPayload is the frame payload limit for protocol 1. It is a constant
+	DataALPN = "queqiao/2"
+	// MaxPayload is the frame payload limit for protocol 2. It is a constant
 	// of the wire, not a deployment setting: a receiver MUST accept a payload
 	// this large and MUST reject a larger one, in both directions.
 	//
 	// A configurable receive limit was the alternative, and it does not work
-	// without negotiation. Version 1 has no capability exchange, so two peers
+	// without negotiation. Version 2 has no capability exchange, so two peers
 	// configured differently are mutually unintelligible in exactly one
 	// direction, and the symptom -- a frame the sender considers legal being
 	// refused as malformed -- names neither the setting nor the peer that
 	// holds it.
 	//
-	// The value is derived rather than round. The largest frame version 1 can
+	// The value is derived rather than round. The largest frame version 2 can
 	// require is a PACKET carrying a maximum UDP datagram to a maximum-length
 	// destination: 2 + 255 + 65507 = 65764 bytes. Everything else is smaller
 	// by construction (a destination OPEN is at most 255, an ACK at most 256,

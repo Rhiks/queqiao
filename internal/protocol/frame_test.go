@@ -8,9 +8,9 @@ import (
 	"testing"
 )
 
-func TestFirstPublicWireVersion(t *testing.T) {
-	if Version != 1 {
-		t.Fatalf("wire version = %d, want first public version 1", Version)
+func TestReplacementJoinWireVersion(t *testing.T) {
+	if Version != 2 {
+		t.Fatalf("wire version = %d, want replacement JOIN version 2", Version)
 	}
 }
 
