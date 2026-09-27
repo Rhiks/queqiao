@@ -333,11 +333,10 @@ type multipathFlow struct {
 	// moment the first one returns, before its fresh lane had any chance to
 	// prove itself.
 	rescueInFlight atomic.Bool
-	// rescueReplacementID is the physical lane the next rescue JOIN should
-	// replace on the peer. The separate bit keeps lane zero representable: a
-	// zero ID is a real initial lane, not the absence of a replacement hint.
-	rescueReplacementID    atomic.Uint64
-	rescueReplacementValid atomic.Bool
+	// Each immutable hint is one recovery episode, including for lane zero.
+	// Clearing compares the exact snapshot so an older callback cannot erase
+	// a newer episode, even when it names the same lane.
+	rescueHint atomic.Pointer[laneReplacementHint]
 	// stallWatchdogDisabled turns the watchdog goroutine off entirely. Zero
 	// in production; tests that pin exact dial counts set it so recovery
 	// behaviour under measurement is deterministic.
@@ -511,6 +510,10 @@ func (f *multipathFlow) addLane(lane *mpLane) error {
 	default:
 	}
 	f.lanesMu.Lock()
+	if f.finished.Load() || f.doneChanClosed() {
+		f.lanesMu.Unlock()
+		return errLaneFlowClosed
+	}
 	if _, exists := f.lanes[lane.id]; exists {
 		f.lanesMu.Unlock()
 		return errLaneDuplicateID
@@ -538,11 +541,10 @@ func (f *multipathFlow) addLane(lane *mpLane) error {
 	if lane.id >= f.nextJoinID {
 		f.nextJoinID = lane.id + 1
 	}
-	f.lanesMu.Unlock()
-	if lane.staged {
-		return nil
+	if !lane.staged {
+		f.startLane(lane)
 	}
-	f.startLane(lane)
+	f.lanesMu.Unlock()
 	return nil
 }
 
@@ -553,11 +555,11 @@ func (f *multipathFlow) activateLane(lane *mpLane) error {
 	if lane == nil || !lane.staged {
 		return errors.New("lane is not staged")
 	}
-	f.lanesMu.RLock()
+	f.lanesMu.Lock()
+	defer f.lanesMu.Unlock()
 	current := f.lanes[lane.id]
 	closed := lane.closed.Load()
-	f.lanesMu.RUnlock()
-	if current != lane || closed || f.doneChanClosed() {
+	if current != lane || closed || f.finished.Load() || f.doneChanClosed() {
 		return errors.New("staged lane is no longer available")
 	}
 	if !lane.ready.CompareAndSwap(false, true) {
@@ -972,24 +974,24 @@ func (f *multipathFlow) retireLaneByID(id uint64) bool {
 }
 
 func (f *multipathFlow) setRescueReplacement(id uint64) {
-	f.rescueReplacementID.Store(id)
-	f.rescueReplacementValid.Store(true)
+	f.rescueHint.Store(&laneReplacementHint{id: id})
 }
 
 func (f *multipathFlow) rescueReplacement() (uint64, bool) {
-	if !f.rescueReplacementValid.Load() {
+	hint := f.rescueHint.Load()
+	if hint == nil {
 		return 0, false
 	}
-	return f.rescueReplacementID.Load(), true
+	return hint.id, true
 }
 
 func (f *multipathFlow) clearRescueReplacement() {
-	f.rescueReplacementValid.Store(false)
+	f.rescueHint.Store(nil)
 }
 
-func (f *multipathFlow) clearRescueReplacementIf(id uint64) {
-	if f.rescueReplacementValid.Load() && f.rescueReplacementID.Load() == id {
-		f.rescueReplacementValid.Store(false)
+func (f *multipathFlow) clearRescueReplacementSnapshot(hint *laneReplacementHint) {
+	if hint != nil {
+		f.rescueHint.CompareAndSwap(hint, nil)
 	}
 }
 
@@ -2695,6 +2697,7 @@ func (f *multipathFlow) acknowledgeRemoteFIN(ctx context.Context, sequence uint6
 // protected by the replay mutex and atomics, so a blocked local Write cannot
 // prevent the opposite direction from releasing its send window.
 func (f *multipathFlow) receiveACK(event inboundEvent) error {
+	hint := f.rescueHint.Load()
 	frame := event.frame
 	if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID {
 		return errors.New("ack belongs to another flow")
@@ -2723,7 +2726,9 @@ func (f *multipathFlow) receiveACK(event inboundEvent) error {
 	}
 	if progress && event.lane != nil {
 		event.lane.suspected.Store(false)
-		f.clearRescueReplacementIf(event.lane.id)
+		if hint != nil && hint.id == event.lane.id {
+			f.clearRescueReplacementSnapshot(hint)
+		}
 	}
 	if final {
 		select {
@@ -3170,11 +3175,16 @@ func (f *multipathFlow) closeAll() {
 		// Mark completion before closing physical lanes. Their reader goroutines
 		// can observe the resulting EOF concurrently; those expected shutdown
 		// errors must not be exported as transport failures.
+		f.lanesMu.Lock()
 		f.finished.Store(true)
-		_ = f.inner.Close()
-		f.lanesMu.RLock()
-		defer f.lanesMu.RUnlock()
+		lanes := make([]*mpLane, 0, len(f.lanes))
 		for _, lane := range f.lanes {
+			lane.closed.Store(true)
+			lanes = append(lanes, lane)
+		}
+		f.lanesMu.Unlock()
+		_ = f.inner.Close()
+		for _, lane := range lanes {
 			_ = lane.fc.Close()
 		}
 	})
