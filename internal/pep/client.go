@@ -375,7 +375,9 @@ type bulkConn struct {
 	packet     net.PacketConn
 	controller wancongestion.TelemetryProvider
 	busy       bool
-	idleTimer  *time.Timer
+	idleTimer  *time.Timer // guarded by Client.bulkMu
+	idleEpoch  uint64      // guarded by Client.bulkMu
+	closeOnce  sync.Once
 }
 
 // controlQUICGeneration owns exactly one shared connection and the packet
@@ -421,17 +423,25 @@ type controlQUICDial struct {
 	superseded bool
 }
 
-func (b *bulkConn) close(reason string) {
+// stopIdleLocked invalidates even a callback that Timer.Stop cannot cancel.
+// The owning client's bulkMu must be held for all timer/epoch operations.
+func (b *bulkConn) stopIdleLocked() {
+	b.idleEpoch++
 	if b.idleTimer != nil {
 		b.idleTimer.Stop()
 		b.idleTimer = nil
 	}
-	if b.conn != nil {
-		_ = b.conn.CloseWithError(0, reason)
-	}
-	if b.packet != nil {
-		_ = b.packet.Close()
-	}
+}
+
+func (b *bulkConn) close(reason string) {
+	b.closeOnce.Do(func() {
+		if b.conn != nil {
+			_ = b.conn.CloseWithError(0, reason)
+		}
+		if b.packet != nil {
+			_ = b.packet.Close()
+		}
+	})
 }
 
 const bulkPoolIdleTimeout = 30 * time.Second
@@ -792,6 +802,9 @@ func (c *Client) closeControlQUICPool(reason string) {
 func (c *Client) closeBulkQUICPool(reason string) {
 	c.bulkMu.Lock()
 	bulkConns := c.bulkConns
+	for _, entry := range bulkConns {
+		entry.stopIdleLocked()
+	}
 	c.bulkConns = nil
 	c.bulkEpoch++
 	for _, cancel := range c.bulkDials {
@@ -1805,6 +1818,7 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 	live := c.bulkConns[:0]
 	for _, entry := range c.bulkConns {
 		if entry.conn.Context().Err() != nil && !entry.busy {
+			entry.stopIdleLocked()
 			entry.close("queqiao stale bulk pool")
 			continue
 		}
@@ -1814,10 +1828,7 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 	for _, entry := range c.bulkConns {
 		if !entry.busy && entry.conn.Context().Err() == nil {
 			entry.busy = true
-			if entry.idleTimer != nil {
-				entry.idleTimer.Stop()
-				entry.idleTimer = nil
-			}
+			entry.stopIdleLocked()
 			c.bulkMu.Unlock()
 			return entry, nil
 		}
@@ -1960,7 +1971,20 @@ func (s *bulkPoolStreamConn) Close() error {
 // following flow can skip the handshake, then closed.
 func (c *Client) releaseBulkConn(entry *bulkConn, dead bool) {
 	c.bulkMu.Lock()
+	found := false
+	for _, existing := range c.bulkConns {
+		if existing == entry {
+			found = true
+			break
+		}
+	}
+	entry.stopIdleLocked()
 	entry.busy = false
+	if !found {
+		c.bulkMu.Unlock()
+		entry.close("queqiao detached bulk pool release")
+		return
+	}
 	if dead {
 		remaining := c.bulkConns[:0]
 		for _, existing := range c.bulkConns {
@@ -1973,16 +1997,14 @@ func (c *Client) releaseBulkConn(entry *bulkConn, dead bool) {
 		entry.close("queqiao bulk pool failed")
 		return
 	}
-	if entry.idleTimer != nil {
-		entry.idleTimer.Stop()
-	}
-	entry.idleTimer = time.AfterFunc(bulkPoolIdleTimeout, func() { c.expireBulkConn(entry) })
+	epoch := entry.idleEpoch
+	entry.idleTimer = time.AfterFunc(bulkPoolIdleTimeout, func() { c.expireBulkConn(entry, epoch) })
 	c.bulkMu.Unlock()
 }
 
-func (c *Client) expireBulkConn(entry *bulkConn) {
+func (c *Client) expireBulkConn(entry *bulkConn, epoch uint64) {
 	c.bulkMu.Lock()
-	if entry.busy {
+	if entry.busy || entry.idleEpoch != epoch {
 		c.bulkMu.Unlock()
 		return
 	}
@@ -1991,6 +2013,7 @@ func (c *Client) expireBulkConn(entry *bulkConn) {
 	for _, existing := range c.bulkConns {
 		if existing == entry {
 			found = true
+			entry.stopIdleLocked()
 			continue
 		}
 		remaining = append(remaining, existing)
