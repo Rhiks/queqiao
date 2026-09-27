@@ -501,23 +501,30 @@ func (f *multipathFlow) confirmOpen() {
 }
 
 func (f *multipathFlow) addLane(lane *mpLane) error {
+	f.lanesMu.Lock()
+	defer f.lanesMu.Unlock()
+	if err := f.validateLaneLocked(lane); err != nil {
+		return err
+	}
+	f.addLaneLocked(lane)
+	return nil
+}
+
+func (f *multipathFlow) validateLaneLocked(lane *mpLane) error {
 	if lane == nil || lane.fc == nil {
 		return errors.New("invalid lane")
 	}
-	select {
-	case <-f.done:
-		return errLaneFlowClosed
-	default:
-	}
-	f.lanesMu.Lock()
 	if f.finished.Load() || f.doneChanClosed() {
-		f.lanesMu.Unlock()
 		return errLaneFlowClosed
 	}
 	if _, exists := f.lanes[lane.id]; exists {
-		f.lanesMu.Unlock()
 		return errLaneDuplicateID
 	}
+	return nil
+}
+
+// addLaneLocked publishes an already validated lane while lanesMu is held.
+func (f *multipathFlow) addLaneLocked(lane *mpLane) {
 	limits := f.memoryLimits
 	if limits.laneWriteQueue < 2 || limits.laneControlReserve >= limits.laneWriteQueue {
 		limits = defaultFlowMemoryLimits()
@@ -544,8 +551,6 @@ func (f *multipathFlow) addLane(lane *mpLane) error {
 	if !lane.staged {
 		f.startLane(lane)
 	}
-	f.lanesMu.Unlock()
-	return nil
 }
 
 // activateLane publishes a staged JOIN lane only after its OPEN_OK was
@@ -874,30 +879,13 @@ func (f *multipathFlow) laneCount() int {
 	return count
 }
 
-// retireOldestLane makes room for a replacement when the peer has observed a
-// dead lane but the server-side socket is still half-open. It is only used at
-// the configured lane cap; deleting the entry keeps the cap a real resource
-// bound rather than allowing unbounded historical lane IDs.
-//
-// The victim is the oldest evictable lane with the replacement's role, or the
-// oldest evictable lane of any role when no same-role lane exists: role
-// orders the choice but never blocks a rescue. One lane is never evictable --
-// a lane younger than minAge, whatever its state. Parallel rescue JOINs race
-// to this endpoint, and admission order is not the order the peer crowned its
-// winner in, so a freshly admitted lane may still be waiting on the peer's
-// decision while the racing losers it beat are still arriving; the half-open
-// sockets eviction exists for are never that young. The age window is also
-// what protects a staged lane whose JOIN handshake is still in flight:
-// admission writes its OPEN_OK under a deadline of the same budget, so a
-// staged lane that never activated and is older than minAge is not a
-// handshake in flight but a wedged admission, and retiring it is how the slot
-// is freed. With no evictable lane the JOIN is refused -- the transient
-// capacity answer the racing peer already expects for its losing attempts.
-func (f *multipathFlow) retireOldestLane(control bool, minAge time.Duration) bool {
-	f.lanesMu.Lock()
+// oldestLaneLocked selects a capacity victim without changing the flow. Young
+// lanes are protected while racing JOIN handshakes settle; role only orders
+// candidates and never prevents recovery. lanesMu must be held.
+func (f *multipathFlow) oldestLaneLocked(control bool, minAge time.Duration, excluded map[uint64]*mpLane) *mpLane {
 	var victim *mpLane
 	for _, lane := range f.lanes {
-		if lane.closed.Load() {
+		if lane.closed.Load() || excluded[lane.id] != nil {
 			continue
 		}
 		if minAge > 0 && time.Since(lane.admitted) < minAge {
@@ -913,20 +901,7 @@ func (f *multipathFlow) retireOldestLane(control bool, minAge time.Duration) boo
 			victim = lane
 		}
 	}
-	if victim == nil {
-		f.lanesMu.Unlock()
-		return false
-	}
-	delete(f.lanes, victim.id)
-	victim.closed.Store(true)
-	f.lanesMu.Unlock()
-	if sched := f.scheduler.Load(); sched != nil {
-		sched.RetireLane(victim.id)
-	}
-	if victim.fc != nil {
-		_ = victim.fc.Close()
-	}
-	return true
+	return victim
 }
 
 // removeLane withdraws a lane whose admission failed after it entered the

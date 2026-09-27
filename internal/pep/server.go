@@ -180,42 +180,64 @@ func (s *serverFlow) addLane(lane *mpLane) error {
 func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, replaceLane bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	f := s.flow
+	f.lanesMu.Lock()
+	retired := make(map[uint64]*mpLane)
+	defer func() {
+		f.lanesMu.Unlock()
+		for _, old := range retired {
+			if sched := f.scheduler.Load(); sched != nil {
+				sched.RetireLane(old.id)
+			}
+			if old.fc != nil {
+				_ = old.fc.Close()
+			}
+		}
+	}()
+	if err := f.validateLaneLocked(lane); err != nil {
+		return err
+	}
 	if s.tcpMode && lane.kind != TransportTCP {
 		return errLaneFlowTCPMode
 	}
-	if lane.kind == TransportTCP && !s.tcpMode {
-		// The first authenticated TCP rescue is a transport handoff, not another
-		// path in a mixed bundle. Retiring QUIC immediately re-offers its chunks
-		// to the reliable scheduler before admitting the TCP lane.
-		s.flow.retireLanesExcept(TransportTCP)
-		s.tcpMode = true
-		s.maxLanes = s.tcpMaxLanes
+	handoff := lane.kind == TransportTCP && !s.tcpMode
+	limit := s.maxLanes
+	if handoff {
+		limit = s.tcpMaxLanes
 	}
-	if replaceLane && replacedLaneID != lane.id {
-		// The replacement hint is authenticated by the existing session and
-		// principal. Retire exactly the named old lane before applying the
-		// normal ceiling, so parallel rescue losers still see the newly admitted
-		// winner as a young protected lane and are refused instead of evicting
-		// it.
-		s.flow.retireLaneByID(replacedLaneID)
-	}
-	if s.flow.laneCount() >= s.maxLanes {
-		// The peer can detect a dead QUIC socket before this endpoint does
-		// (for example, when the return path is black-holed). Admission at
-		// the ceiling is by eviction, and no role blocks it: the choice is
-		// limited only by the rescue-race window -- lanes whose JOIN
-		// handshake is in flight or whose admission is younger than the
-		// path-detection budget may still be waiting on the peer's crowning
-		// decision, so evicting one can kill the rescue that just won.
-		if !s.flow.retireOldestLane(lane.control, laneDeadPathDetection) || s.flow.laneCount() >= s.maxLanes {
-			return errLaneLimitReached
+	// Plan the entire admission before retiring anything. Duplicate IDs,
+	// shutdown, or a capacity refusal must leave the old transport intact.
+	remaining := 0
+	for id, old := range f.lanes {
+		if old.closed.Load() {
+			continue
+		}
+		if (handoff && old.kind != TransportTCP) || (replaceLane && replacedLaneID != lane.id && id == replacedLaneID) {
+			retired[id] = old
+		} else {
+			remaining++
 		}
 	}
-	if err := s.flow.addLane(lane); err != nil {
-		return err
+	if remaining >= limit {
+		victim := f.oldestLaneLocked(lane.control, laneDeadPathDetection, retired)
+		if victim == nil || remaining-1 >= limit {
+			// The deferred cleanup owns committed retirements only.
+			clear(retired)
+			return errLaneLimitReached
+		}
+		retired[victim.id] = victim
 	}
+	for id, old := range retired {
+		delete(f.lanes, id)
+		old.closed.Store(true)
+	}
+	if handoff {
+		s.tcpMode = true
+		s.maxLanes = limit
+	}
+	f.addLaneLocked(lane)
 	if s.tcpMode && s.maxLanes > 1 {
-		s.flow.tcpStriping.Store(true)
+		f.tcpStriping.Store(true)
 	}
 	return nil
 }
