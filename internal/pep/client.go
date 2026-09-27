@@ -237,7 +237,8 @@ type Client struct {
 	hopWalk     *portmux.HopWalk
 	// openFlowForTest stands in for one flow-open attempt, so the retry policy
 	// can be tested without a network that loses things on demand.
-	openFlowForTest func() (*openedFlow, error)
+	openFlowForTest               func() (*openedFlow, error)
+	probeControlGenerationForTest func(context.Context, *controlQUICGeneration, time.Duration) error
 	// openJoinLaneForTest controls handshake completion during manager shutdown.
 	openJoinLaneForTest func(context.Context, TransportKind, uint64) (*mpLane, error)
 	// flowOpenRetryDelayForTest makes retry timing deterministic without
@@ -382,6 +383,9 @@ type bulkConn struct {
 // precise: a late failure from an old stream can retire its own generation but
 // can never close the healthy generation which replaced it.
 type controlQUICGeneration struct {
+	borrowMu   sync.Mutex
+	borrowers  int
+	draining   bool
 	probeMu    sync.Mutex
 	verified   time.Time
 	probe      *controlPathProbe
@@ -1483,6 +1487,12 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 	if err != nil {
 		return nil, err
 	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			generation.releaseBorrow()
+		}
+	}()
 	if err := c.verifyControlPath(dialCtx, generation); err != nil {
 		return nil, err
 	}
@@ -1500,6 +1510,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 		quicStreamConn: &quicStreamConn{stream: stream, conn: generation.conn, controller: generation.controller, closeConn: false, bulk: connBulkPath(generation.conn, c.memoryLimits.eventQueue)},
 		owner:          c, generation: generation,
 	}
+	transferred = true
 	return outer, nil
 }
 
@@ -1515,6 +1526,9 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 		c.checkSystemResume()
 		c.quicMu.Lock()
 		if generation := c.quicGeneration; generation != nil && generation.conn.Context().Err() == nil {
+			generation.borrowMu.Lock()
+			generation.borrowers++
+			generation.borrowMu.Unlock()
 			c.quicMu.Unlock()
 			return generation, nil
 		}
@@ -1920,6 +1934,7 @@ func pooledTransportTimedOut(err error) bool {
 func (s *controlPoolStreamConn) Close() error {
 	err := s.quicStreamConn.Close()
 	s.once.Do(func() {
+		s.generation.releaseBorrow()
 		if remaining := s.owner.quicPoolActive.Add(-1); remaining < 0 {
 			s.owner.quicPoolActive.Store(0)
 		}

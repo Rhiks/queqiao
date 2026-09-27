@@ -10,7 +10,8 @@ import (
 )
 
 // Borrowers share one round-trip check when the last real proof is stale.
-// Failure rejects this borrow; a live connection and its siblings stay intact.
+// Failure drains this generation: new borrowers get a fresh connection,
+// while existing siblings keep their transport until they finish.
 type controlPathProbe struct {
 	done chan struct{}
 	err  error
@@ -29,7 +30,14 @@ func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration
 		go func() {
 			probeCtx, cancel := context.WithTimeout(g.conn.Context(), c.cfg.HandshakeTimeout)
 			defer cancel()
-			pending.err = probeControlGeneration(probeCtx, g, c.cfg.HandshakeTimeout)
+			probe := probeControlGeneration
+			if c.probeControlGenerationForTest != nil {
+				probe = c.probeControlGenerationForTest
+			}
+			pending.err = probe(probeCtx, g, c.cfg.HandshakeTimeout)
+			if pending.err != nil {
+				c.drainControlQUICGeneration(g)
+			}
 			g.probeMu.Lock()
 			if pending.err == nil {
 				g.verified = time.Now()
@@ -74,4 +82,31 @@ func probeControlGeneration(ctx context.Context, g *controlQUICGeneration, budge
 		return errors.New("invalid pooled path probe echo")
 	}
 	return finish()
+}
+
+// Detach before marking the generation draining, under the same pool lock
+// used to reserve borrowers. No future acquire can revive it.
+func (c *Client) drainControlQUICGeneration(g *controlQUICGeneration) {
+	c.quicMu.Lock()
+	if c.quicGeneration == g {
+		c.quicGeneration = nil
+	}
+	g.borrowMu.Lock()
+	g.draining = true
+	closeNow := g.borrowers == 0
+	g.borrowMu.Unlock()
+	c.quicMu.Unlock()
+	if closeNow {
+		g.close("queqiao failed path probe drained")
+	}
+}
+
+func (g *controlQUICGeneration) releaseBorrow() {
+	g.borrowMu.Lock()
+	g.borrowers--
+	closeNow := g.draining && g.borrowers == 0
+	g.borrowMu.Unlock()
+	if closeNow {
+		g.close("queqiao drained generation released")
+	}
 }
