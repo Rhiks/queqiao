@@ -238,6 +238,8 @@ type Client struct {
 	// openFlowForTest stands in for one flow-open attempt, so the retry policy
 	// can be tested without a network that loses things on demand.
 	openFlowForTest func() (*openedFlow, error)
+	// openJoinLaneForTest controls handshake completion during manager shutdown.
+	openJoinLaneForTest func(context.Context, TransportKind, uint64) (*mpLane, error)
 	// flowOpenRetryDelayForTest makes retry timing deterministic without
 	// weakening the production jitter shared by concurrent callers.
 	flowOpenRetryDelayForTest func(failedAttempt int) time.Duration
@@ -1645,6 +1647,9 @@ func dedicatedBulkFallbackAllowed(err error) bool {
 }
 
 func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID [16]byte, flowID, laneID uint64) (*mpLane, error) {
+	if c.openJoinLaneForTest != nil {
+		return c.openJoinLaneForTest(ctx, kind, laneID)
+	}
 	if kind != TransportQUIC && kind != TransportTCP {
 		return nil, fmt.Errorf("unsupported join transport %q", kind)
 	}
@@ -2019,7 +2024,9 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 	}()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	joins := make(chan laneJoinResult, 1)
+	// Ownership transfers only when the manager receives the lane. A buffered
+	// result can outlive this manager and leak its transport on cancellation.
+	joins := make(chan laneJoinResult)
 	joinPending := false
 	isolated := false
 	var lastDecision time.Time
@@ -2311,7 +2318,9 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
-	joins := make(chan laneJoinResult, maxTCPFallbackLanes)
+	// Keep ownership with the dialer until this manager accepts the result.
+	// On shutdown an undelivered lane is closed by the dialer instead.
+	joins := make(chan laneJoinResult)
 	pending := 0
 	bundleFailures := 0
 	recoveryAttempts := 0
