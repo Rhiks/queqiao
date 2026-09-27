@@ -87,7 +87,7 @@ func (c *Client) uplinkEvents(ctx context.Context) <-chan struct{} {
 		return nil
 	}
 	if err = syscall.SetNonblock(fd, true); err != nil {
-		syscall.Close(fd)
+		_ = syscall.Close(fd) // Best-effort cleanup after initialization failed.
 		return nil
 	}
 	file := os.NewFile(uintptr(fd), "queqiao-uplink-events")

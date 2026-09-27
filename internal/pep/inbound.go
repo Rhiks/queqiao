@@ -39,7 +39,7 @@ func (f *multipathFlow) queueInbound(event inboundEvent) bool {
 }
 
 func (f *multipathFlow) releaseInbound(event inboundEvent) {
-	if !event.queued {
+	if !event.queued || event.charged < 0 {
 		return
 	}
 	f.receiveMemory.Release(event.charged)

@@ -853,7 +853,13 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 
 	var counters udpCounters
 	activity := make(chan struct{}, 1)
-	forward := newUDPForwarder(assocCtx, udpConn, s.cfg.DestinationPolicy.ResolveUDPAddr, func(n int) { counters.up.Add(uint64(n)); notifyActivity(activity) })
+	forward := newUDPForwarder(assocCtx, udpConn, s.cfg.DestinationPolicy.ResolveUDPAddr, func(n int) {
+		if n < 0 {
+			return
+		}
+		counters.up.Add(uint64(n))
+		notifyActivity(activity)
+	})
 	defer func() {
 		cancel()
 		_ = udpConn.SetReadDeadline(time.Now())
