@@ -11,6 +11,7 @@ class FieldSoakTests(unittest.TestCase):
         self.assertEqual((status, body), (200, b"ok"))
         for response in (
             b"incomplete",
+            b"HTTP/1.1 200 OK\r\n",
             b"HTTP/1.1 nope Bad\r\n\r\n",
             b"HTTP/1.1 503 Bad\r\n\r\n",
         ):

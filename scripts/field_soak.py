@@ -60,6 +60,9 @@ def socks_connect(endpoint: tuple[str, int], destination: tuple[str, int], timeo
 
 
 def parse_https_response(response: bytes) -> tuple[int, bytes]:
+    if b"\r\n\r\n" not in response:
+        raise RuntimeError("HTTPS response has no complete header")
+
     class ResponseSocket:
         def makefile(self, mode):
             return io.BytesIO(response)
