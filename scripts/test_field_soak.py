@@ -18,6 +18,22 @@ class FieldSoakTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     field_soak.parse_https_response(response)
 
+    def test_https_truncation_and_chunked_body(self):
+        with self.assertRaises(RuntimeError):
+            field_soak.parse_https_response(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nshort")
+        with self.assertRaises(RuntimeError):
+            field_soak.parse_https_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nab")
+        self.assertEqual(
+            field_soak.parse_https_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"),
+            (200, b"ok"),
+        )
+
+    def test_expected_body_hash_is_enforced(self):
+        field_soak.verify_body_hash({"body_sha256": "a" * 64}, "a" * 64)
+        field_soak.verify_body_hash({"body_sha256": "b" * 64}, None)
+        with self.assertRaises(RuntimeError):
+            field_soak.verify_body_hash({"body_sha256": "b" * 64}, "a" * 64)
+
     def test_socks_reply_rejects_failure(self):
         class Connection:
             def __init__(self):

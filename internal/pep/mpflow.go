@@ -2815,14 +2815,9 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 					}
 					continue
 				}
-				out, closed, err := reassembler.Insert(multipath.Segment{Sequence: frame.Header.Sequence, Payload: frame.Payload})
+				closed, err := reassembler.InsertTo(multipath.Segment{Sequence: frame.Header.Sequence, Payload: frame.Payload}, deliverToInner)
 				if err != nil {
 					return err
-				}
-				if len(out) > 0 {
-					if err := deliverToInner(out); err != nil {
-						return err
-					}
 				}
 				lastAckSequence = f.acknowledgeArrival(reassembler, lastAckSequence)
 				if closed {
@@ -2856,14 +2851,9 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 					// sender only preserves work that can never be consumed.
 					return f.acknowledgeRemoteFIN(ctx, frame.Header.Sequence, true)
 				}
-				out, closed, err := reassembler.Insert(multipath.Segment{Sequence: frame.Header.Sequence, Final: true})
+				closed, err := reassembler.InsertTo(multipath.Segment{Sequence: frame.Header.Sequence, Final: true}, deliverToInner)
 				if err != nil {
 					return err
-				}
-				if len(out) > 0 {
-					if err := deliverToInner(out); err != nil {
-						return err
-					}
 				}
 				if closed {
 					if err := f.acknowledgeRemoteFIN(ctx, reassembler.NextSequence(), abort); err != nil {

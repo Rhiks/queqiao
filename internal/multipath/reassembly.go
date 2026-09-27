@@ -77,6 +77,23 @@ func (r *Reassembler) Closed() bool          { return r.finalAt != nil && r.next
 // newly contiguous bytes. The caller owns the returned byte slice. Overlapping
 // segments are rejected rather than silently merging untrusted input.
 func (r *Reassembler) Insert(segment Segment) ([]byte, bool, error) {
+	return r.insert(segment, nil)
+}
+
+// InsertTo delivers contiguous segments synchronously without assembling a
+// second, potentially window-sized output buffer. The callback must not retain
+// its slice. Shared memory stays charged until each callback returns, including
+// while the application blocks. On callback error the caller must close the
+// reassembler and terminate the flow; already delivered bytes cannot be retried.
+func (r *Reassembler) InsertTo(segment Segment, deliver func([]byte) error) (bool, error) {
+	if deliver == nil {
+		return false, errors.New("nil reassembly delivery callback")
+	}
+	_, closed, err := r.insert(segment, deliver)
+	return closed, err
+}
+
+func (r *Reassembler) insert(segment Segment, deliver func([]byte) error) ([]byte, bool, error) {
 	if segment.Final && len(segment.Payload) != 0 {
 		return nil, false, errors.New("FIN segment must not carry payload")
 	}
@@ -142,10 +159,16 @@ func (r *Reassembler) Insert(segment Segment) ([]byte, bool, error) {
 		}
 		return nil, r.Closed(), nil
 	}
-	return r.consumeContiguous(segment)
+	if deliver != nil && !segment.Final {
+		if !r.memory.TryAcquire(len(segment.Payload)) {
+			return nil, false, ErrMemoryBudget
+		}
+		segment.charged = true
+	}
+	return r.consumeContiguous(segment, deliver)
 }
 
-func (r *Reassembler) consumeContiguous(first Segment) ([]byte, bool, error) {
+func (r *Reassembler) consumeContiguous(first Segment, deliver func([]byte) error) ([]byte, bool, error) {
 	var output []byte
 	current := first
 	for {
@@ -157,10 +180,18 @@ func (r *Reassembler) consumeContiguous(first Segment) ([]byte, bool, error) {
 			r.finalAt = &at
 			return output, true, nil
 		}
-		output = append(output, current.Payload...)
+		var err error
+		if deliver == nil {
+			output = append(output, current.Payload...)
+		} else {
+			err = deliver(current.Payload)
+		}
 		if current.charged {
 			r.memory.Release(len(current.Payload))
 			current.charged = false
+		}
+		if err != nil {
+			return nil, false, err
 		}
 		r.next += uint64(len(current.Payload))
 		if next, ok := r.buffer[r.next]; ok {
