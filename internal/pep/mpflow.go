@@ -721,11 +721,16 @@ func (f *multipathFlow) localAbortDrainGrace() time.Duration {
 // delivered every source chunk, so sendFinal is too late to be the first place
 // that records this sequence.
 func (f *multipathFlow) noteLocalClose(sequence uint64) {
-	f.sendSequence(sequence)
-	f.localClosed.Store(true)
-	if f.localClosedCh != nil {
-		f.localClosedOnce.Do(func() { close(f.localClosedCh) })
-	}
+	// EOF and a failed response write can race. The first close publishes
+	// the sequence used on wire; a late source read must not change the
+	// expected final ACK after an abort has already been sent.
+	f.localClosedOnce.Do(func() {
+		f.sendSequence(sequence)
+		f.localClosed.Store(true)
+		if f.localClosedCh != nil {
+			close(f.localClosedCh)
+		}
+	})
 }
 
 // noteRemoteAbort makes an explicit full close an out-of-band cancellation
@@ -2695,6 +2700,12 @@ func (f *multipathFlow) receiveACK(event inboundEvent) error {
 	if final && frame.Header.Sequence != f.finSequence.Load() {
 		return errors.New("final acknowledgement sequence mismatch")
 	}
+	if final && f.localAbortSent.Load() {
+		// An abort cancels unread/unscheduled source bytes as well. Its ACK
+		// confirms closure, not delivery; do not credit these bytes to the
+		// send window or reject them merely because they were never sent.
+		return errLocalApplicationClose
+	}
 	progress, err := f.acknowledgeCoverage(frame.Header.Sequence, final, ranges)
 	if err != nil {
 		return err
@@ -2709,13 +2720,6 @@ func (f *multipathFlow) receiveACK(event inboundEvent) error {
 		select {
 		case f.finalAck <- struct{}{}:
 		default:
-		}
-		if f.localAbortSent.Load() {
-			// This acknowledgement covers the abort sequence and every
-			// source chunk before it. Tell run to retire the sender rather
-			// than waiting for a remote FIN that an aborted flow will not
-			// send.
-			return errLocalApplicationClose
 		}
 	}
 	return nil

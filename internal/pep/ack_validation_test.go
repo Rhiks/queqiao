@@ -2,6 +2,7 @@ package pep
 
 import (
 	"context"
+	"errors"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"net"
 	"testing"
@@ -62,5 +63,34 @@ func TestACKValidationIsAtomicAndProgressRequiresNewCoverage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The receive worker may abort a full-closed socket before a pending source
+// read returns. That later EOF must not change the sequence already on wire.
+func TestAbortACKSurvivesLateSourceEOF(t *testing.T) {
+	for _, sent := range []int{32, 64} {
+		inner, peer := net.Pipe()
+		f := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
+			protocol.FlagAckUp, protocol.FlagAckDown, nil, nil)
+		f.noteSent(0, sent)
+		f.noteLocalClose(64)
+		f.localAbortSent.Store(true)
+		f.noteLocalClose(128)
+		frame := protocol.Frame{Header: protocol.Header{Version: protocol.Version,
+			Type: protocol.TypeAck, SessionID: f.sessionID, FlowID: f.flowID,
+			Flags: protocol.FlagAckUp | protocol.FlagAckFinal, Sequence: 64}}
+		if err := f.receiveACK(inboundEvent{frame: frame}); !errors.Is(err, errLocalApplicationClose) {
+			t.Errorf("sent=%d: abort ACK after late EOF: %v", sent, err)
+		}
+		if f.acked != 0 {
+			t.Errorf("abort ACK falsely credited delivery: %d", f.acked)
+		}
+		frame.Header.Sequence = 65
+		if err := f.receiveACK(inboundEvent{frame: frame}); err == nil || errors.Is(err, errLocalApplicationClose) {
+			t.Errorf("mismatched abort ACK accepted: %v", err)
+		}
+		f.closeAll()
+		peer.Close()
 	}
 }

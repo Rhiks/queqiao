@@ -535,6 +535,10 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 // acknowledged, and waits for the peer's final acknowledgement.
 func (f *multipathFlow) sendFinal(ctx context.Context, sequence uint64) error {
 	f.noteLocalClose(sequence)
+	if f.localAbortSent.Load() {
+		return nil
+	}
+	sequence = f.finSequence.Load()
 	fin := protocol.Frame{Header: protocol.Header{
 		Version: protocol.Version, Type: protocol.TypeClose, Flags: protocol.FlagFin,
 		SessionID: f.sessionID, FlowID: f.flowID, Sequence: sequence, Class: protocol.Class(f.class.Load()),

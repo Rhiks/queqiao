@@ -58,3 +58,13 @@ the congestion controller, aggregate pacing or FEC policy requires evidence
 that the Tokyo workload encounters this bottleneck and a controlled comparison.
 The proposed new AI scheduler/profile and active-ACK pool lease remain deferred
 for the same reason. None are silently marked implemented.
+
+## Close acknowledgement follow-up
+
+A failed application write and a late source EOF could publish different close
+sequences. The first local close now owns the immutable terminal sequence, and
+normal FIN emission uses that same value. An authenticated, matching abort ACK
+ends cancellation without crediting unscheduled bytes as delivered. The focused
+regression reproduces the former sequence mismatch and checks that malformed
+terminal sequences are still rejected. This shared flow change applies to both
+clients and gateways; it does not promise equal RTT across access networks.
