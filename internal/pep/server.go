@@ -1172,7 +1172,10 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		}})
 	}
 	cancelWrite()
+	// A retired lane must release its admission slot while the logical flow
+	// continues on its replacement. Waiting only for the flow leaks slots.
 	select {
+	case <-fc.done:
 	case <-serverSession.flow.doneChan():
 	case <-ctx.Done():
 	}

@@ -651,6 +651,10 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 // select, then check both queues while waiting. The non-blocking first check
 // closes the common race where both queues already have work.
 func nextLaneFrame(lane *mpLane, done <-chan struct{}, ctxDone <-chan struct{}) (laneFrame, bool) {
+	var laneDone <-chan struct{}
+	if lane.fc != nil {
+		laneDone = lane.fc.done
+	}
 	if lane.writeInteractiveQ != nil {
 		select {
 		case frame := <-lane.writeInteractiveQ:
@@ -660,6 +664,8 @@ func nextLaneFrame(lane *mpLane, done <-chan struct{}, ctxDone <-chan struct{}) 
 	}
 	for {
 		select {
+		case <-laneDone:
+			return laneFrame{}, false
 		case <-done:
 			return laneFrame{}, false
 		case <-ctxDone:
@@ -678,6 +684,8 @@ func nextLaneFrame(lane *mpLane, done <-chan struct{}, ctxDone <-chan struct{}) 
 			return frame, true
 		case frame := <-lane.writeQ:
 			return frame, true
+		case <-laneDone:
+			return laneFrame{}, false
 		case <-done:
 			return laneFrame{}, false
 		case <-ctxDone:

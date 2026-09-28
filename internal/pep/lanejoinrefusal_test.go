@@ -270,3 +270,54 @@ func TestCompletedJoinReplayHonorsCancellation(t *testing.T) {
 		})
 	}
 }
+
+func TestRetiredJoinReleasesHandlerAndWriterWhileFlowLives(t *testing.T) {
+	flow := newIsolationTestFlow(t, false)
+	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "device"}
+	ss := newServerFlow(flow, owner, TransportTCP, 1)
+	server := &Server{cfg: ServerConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, sessions: map[[16]byte]*serverFlow{flow.sessionID: ss}, metrics: metrics.New()}
+	for id := uint64(1); id <= 8; id++ {
+		local, remote := net.Pipe()
+		fc := newFrameConn(local)
+		returned := make(chan struct{})
+		go func() {
+			defer close(returned)
+			server.handleLaneJoinOpen(context.Background(), local, fc, owner, flow.sessionID, id, protocol.Frame{Header: protocol.Header{FlowID: flow.flowID}})
+		}()
+		_ = remote.SetReadDeadline(time.Now().Add(time.Second))
+		response, err := newFrameConn(remote).Read()
+		if err != nil || response.Header.Type != protocol.TypeOpenOK {
+			t.Fatalf("join %d failed: %v", id, err)
+		}
+		flow.lanesMu.Lock()
+		lane := flow.lanes[id]
+		flow.lanesMu.Unlock()
+		if lane == nil {
+			t.Fatal("missing admitted lane")
+		}
+		deadline := time.Now().Add(time.Second)
+		for !lane.ready.Load() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if !lane.ready.Load() {
+			t.Fatal("JOIN did not activate")
+		}
+		flow.retireLaneByID(id)
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatal("retired JOIN retained handler/admission slot")
+		}
+		select {
+		case <-lane.writeDone:
+		case <-time.After(time.Second):
+			t.Fatal("retired JOIN retained idle writer")
+		}
+		select {
+		case <-flow.doneChan():
+			t.Fatal("retirement ended logical flow")
+		default:
+		}
+		_ = remote.Close()
+	}
+}
