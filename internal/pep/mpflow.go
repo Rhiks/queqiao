@@ -356,6 +356,9 @@ type multipathFlow struct {
 	bytesUp         atomic.Uint64
 	bytesDown       atomic.Uint64
 	class           atomic.Uint32
+	// Once coded DATA stops making progress, use the reliable stream for this
+	// flow. Datagram delivery cannot be repaired by endlessly re-coding it.
+	codingStalled atomic.Bool
 	// ackTrack answers "has this range arrived?", which is what clocks every
 	// lane. scheduler and sendCtx let a lane joined mid-flow start carrying
 	// data as soon as it is admitted.
@@ -1155,6 +1158,9 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 // too short to trigger a fast retransmit recovers by timeout, and a timeout is
 // a round trip that coding does not spend.
 func (f *multipathFlow) prefersCodingOverRetransmission() bool {
+	if f.codingStalled.Load() {
+		return false
+	}
 	// How much this flow has moved is the immediate answer; the class is the
 	// considered one. Both are needed because they become available at
 	// different times, and each is wrong about a case the other gets right.
@@ -1917,6 +1923,18 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		newEpisode := !episode
 		if newEpisode {
 			episode = true
+			// An application stall is evidence against the current DATA substrate,
+			// even when QUIC itself keeps acknowledging packets. The server cannot
+			// dial a replacement lane, so merely queuing stallSignal leaves its
+			// response retrying on datagrams indefinitely. Existing outstanding
+			// unreliable attempts expire normally; their next dispatch is pinned
+			// to the authenticated stream by the scheduler's reliability snapshot.
+			for _, lane := range f.healthyLanes() {
+				if lane.fc.codesData() {
+					f.codingStalled.Store(true)
+					break
+				}
+			}
 			spare := f.suspectDataLanes()
 			if f.metrics != nil {
 				f.metrics.FlowStallDetected()
