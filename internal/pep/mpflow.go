@@ -2260,39 +2260,52 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		deadlineExpired := false
 		select {
 		case <-ticker.C:
-			if len(f.healthyLanes()) > 0 {
-				f.endReplacementOutage()
-				return nil
-			}
-			if f.resumeRefused.Load() {
-				// The peer does not have this session, and never will: a
-				// session identifier is random and is not reissued. Waiting out
-				// the replacement grace here is time the application spends
-				// learning nothing. Measured under 35% correlated loss, where
-				// the handshake itself often fails, this was 45 seconds of
-				// silence per lost flow.
-				return errResumeRefused
-			}
-			if f.replacementAbandoned.Load() {
-				// The refusal above is the answer this flow gets when a rescue
-				// handshake completes. On a path lossy enough to kill every
-				// lane, the rescue handshake is usually what fails instead, so
-				// that answer often never arrives and the flow used to wait out
-				// the whole grace -- and then, once the attempt budget reset,
-				// several more of them. This is the same conclusion reached
-				// from evidence this endpoint already has: it has stopped
-				// trying to replace the lane.
-				return errReplacementAbandoned
-			}
 		case <-timer.C:
-			f.replacementTimeouts.Add(1)
-			return errLaneReplacementTimeout
+			deadlineExpired = true
 		case <-f.done:
 			return errors.New("flow closed while waiting for lane replacement")
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+		if len(f.healthyLanes()) > 0 {
+			f.endReplacementOutage()
+			return nil
+		}
+		if f.resumeRefused.Load() {
+			// The peer does not have this session, and never will: a
+			// session identifier is random and is not reissued. Waiting out
+			// the replacement grace here is time the application spends
+			// learning nothing. Measured under 35% correlated loss, where
+			// the handshake itself often fails, this was 45 seconds of
+			// silence per lost flow.
+			return errResumeRefused
+		}
+		if f.replacementAbandoned.Load() {
+			// The refusal above is the answer this flow gets when a rescue
+			// handshake completes. On a path lossy enough to kill every
+			// lane, the rescue handshake is usually what fails instead, so
+			// that answer often never arrives and the flow used to wait out
+			// the whole grace -- and then, once the attempt budget reset,
+			// several more of them. This is the same conclusion reached
+			// from evidence this endpoint already has: it has stopped
+			// trying to replace the lane.
+			return errReplacementAbandoned
+		}
+		if deadlineExpired {
+			// A validated rescue JOIN may have extended this outage while
+			// the timer was armed. Honor the shared deadline without opening
+			// a new grace if another waiter already cleared the outage.
+			if deadline := f.replacementDeadline.Load(); deadline != 0 {
+				if remaining := time.Until(time.Unix(0, deadline)); remaining > 0 {
+					timer.Reset(remaining)
+					continue
+				}
+			}
+			f.replacementTimeouts.Add(1)
+			return errLaneReplacementTimeout
 		}
 	}
 }
