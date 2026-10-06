@@ -356,9 +356,11 @@ type multipathFlow struct {
 	bytesUp         atomic.Uint64
 	bytesDown       atomic.Uint64
 	class           atomic.Uint32
-	// Once coded DATA stops making progress, use the reliable stream for this
-	// flow. Datagram delivery cannot be repaired by endlessly re-coding it.
-	codingStalled atomic.Bool
+	// codingRecoveryEnd bounds a stalled coded send's stream escape. Once the
+	// peer has acknowledged the bytes pending at detection, their recovery is
+	// complete. Newer exchanges remain eligible for coding while feedback is
+	// delayed, and each retry pins its own reliability at dispatch.
+	codingRecoveryEnd atomic.Uint64
 	// ackTrack answers "has this range arrived?", which is what clocks every
 	// lane. scheduler and sendCtx let a lane joined mid-flow start carrying
 	// data as soon as it is admitted.
@@ -1158,9 +1160,6 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 // too short to trigger a fast retransmit recovers by timeout, and a timeout is
 // a round trip that coding does not spend.
 func (f *multipathFlow) prefersCodingOverRetransmission() bool {
-	if f.codingStalled.Load() {
-		return false
-	}
 	// How much this flow has moved is the immediate answer; the class is the
 	// considered one. Both are needed because they become available at
 	// different times, and each is wrong about a case the other gets right.
@@ -1929,9 +1928,12 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			// response retrying on datagrams indefinitely. Existing outstanding
 			// unreliable attempts expire normally; their next dispatch is pinned
 			// to the authenticated stream by the scheduler's reliability snapshot.
+			// This escape lasts only until the bytes pending now are acknowledged:
+			// loss of feedback alone is not evidence against future coded DATA.
+			// Only those byte offsets escape; later exchanges remain coded.
 			for _, lane := range f.healthyLanes() {
 				if lane.fc.codesData() {
-					f.codingStalled.Store(true)
+					f.escapePendingCoding()
 					break
 				}
 			}
@@ -1970,6 +1972,31 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			}
 		}
 	}
+}
+
+// escapePendingCoding keeps the current stalled bytes on a reliable carrier
+// until the peer confirms their delivery. Capture under the ACK lock so an ACK
+// arriving between the watchdog's scan and this decision cannot leave an
+// already-completed recovery latched. Do not move an active recovery's frontier
+// forward with new data: the stall says nothing about that later traffic.
+func (f *multipathFlow) escapePendingCoding() {
+	f.replayMu.Lock()
+	defer f.replayMu.Unlock()
+	if f.codingRecoveryEnd.Load() != 0 || f.highestSent <= f.acked {
+		return
+	}
+	if f.ackTrack != nil && f.ackTrack.Covered(0, f.highestSent) {
+		return
+	}
+	f.codingRecoveryEnd.Store(f.highestSent)
+}
+
+// recoverChunkReliably is the byte-scoped part of the substrate decision.
+// Delayed ACKs for old data cannot put fresh exchanges behind a stream's head
+// of line. The scheduler snapshots this before queueing the write, preserving
+// reliable retries even when their acknowledgement races the writer.
+func (f *multipathFlow) recoverChunkReliably(offset uint64) bool {
+	return offset < f.codingRecoveryEnd.Load()
 }
 
 // suspectDataLanes marks the lanes currently carrying the flow's data as
@@ -2394,6 +2421,10 @@ func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges 
 	if f.ackTrack != nil {
 		f.ackTrack.Advance(sequence)
 		advanced = f.ackTrack.Add(ranges) || advanced
+	}
+	if end := f.codingRecoveryEnd.Load(); end != 0 &&
+		(f.acked >= end || f.ackTrack != nil && f.ackTrack.Covered(0, end)) {
+		f.codingRecoveryEnd.Store(0)
 	}
 	if final && f.closeFrame != nil && f.closeFrame.Header.Sequence <= sequence {
 		f.closeFrame = nil

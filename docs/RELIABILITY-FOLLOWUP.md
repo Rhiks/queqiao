@@ -44,8 +44,13 @@ control lifetime is unchanged). New handshakes and recent successful probes
 skip another probe; expired entries are exclusively reserved before a bounded
 check. Failure removes only that entry, preserving shared control siblings.
 Focused tests cover failed-entry retirement, real probe success, hot reuse and
-sibling round trips. This does not claim an active-ACK lease fast path or a
-measured WAN latency improvement.
+sibling round trips. The first authenticated response on a new control-pool
+stream now also supplies proof, dated no later than that stream's creation.
+Reading buffered traffic later cannot renew it, and a transport failure
+invalidates evidence from previously opened streams. This preserves idle
+validation without periodically probing a sequence of successful short flows.
+It does not claim an active-ACK lease fast path or a measured WAN latency
+improvement.
 
 The local operator's AI route uses the existing router's category data and a
 fixed Tokyo group. This deployment policy does not belong in generic transport
@@ -58,6 +63,50 @@ the congestion controller, aggregate pacing or FEC policy requires evidence
 that the Tokyo workload encounters this bottleneck and a controlled comparison.
 The proposed new AI scheduler/profile and active-ACK pool lease remain deferred
 for the same reason. None are silently marked implemented.
+
+## Coded stall recovery scope
+
+A send stall temporarily escapes coded DATA onto the authenticated reliable
+stream. The escape applies only to byte offsets outstanding when it began;
+later exchanges retain their ordinary coding policy while those bytes recover.
+Validated cumulative or selective acknowledgements covering that fixed frontier
+end the recovery. A delayed acknowledgement therefore cannot disable coding for
+the rest of an interactive flow. Already dispatched retries retain their
+reliable-carrier snapshot even if recovery ends before their writer runs.
+The stall thresholds, retry deadlines and wire format are unchanged.
+
+While an optimistic OPEN is awaiting confirmation on a healthy original lane,
+the client does not start a speculative stall-rescue JOIN. Such a JOIN could
+overtake OPEN on a different stream and receive a terminal "unknown session"
+answer before the session exists. The original OPEN deadline still bounds this
+wait, and actual loss of the original lane still permits replacement recovery.
+Once OPEN is confirmed, established-flow refusals retain their terminal meaning.
+
+### Validation and remaining short-flow limit
+
+The October 6 follow-up used Go 1.25.13 on Linux/amd64. The unchanged
+small-exchange integration test passed five native and five race runs, with
+known-path medians of 303--311 ms on the 300 ms, 42% erasure path. The warm-pool
+test now covers six warm flows at its unchanged latency bound. Deterministic
+regressions reproduce both the redundant probe and the premature JOIN refusal
+when their respective fixes are removed.
+
+The complete `go test -p=1 -count=1 -timeout 50m ./...` run finished with seven
+environmental failures: five Unix-socket tests and two interface-enumeration
+tests returned `operation not permitted` in the test container. All other
+assertions passed in that run; this is not a claim of a green full suite or
+cross-platform validation. Vet, staticcheck, formatting, changelog validation
+and the 91 Python tests passed.
+
+End-to-end short-flow latency under extreme erasure remains unresolved. Three
+additional race runs of the 20-flow, 300 ms RTT, 45% erasure case completed all
+flows but measured medians of 960, 1266 and 967 ms against its unchanged 900 ms
+bound. OPEN still travels on the reliable stream, and packet traces confirm
+that its loss can delay registration even when coded DATA has already arrived.
+The test also omits failed response reads from its latency samples, so its
+survivor median must be read together with completion counts. These fixes do
+not protect OPEN with coding, relax that timing assertion, or establish a WAN
+latency improvement.
 
 ## Close acknowledgement follow-up
 

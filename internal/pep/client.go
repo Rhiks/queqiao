@@ -392,6 +392,7 @@ type controlQUICGeneration struct {
 	draining   bool
 	probeMu    sync.Mutex
 	verified   time.Time
+	proofEpoch uint64
 	probe      *controlPathProbe
 	id         uint64
 	conn       *quic.Conn
@@ -1511,6 +1512,12 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 	if err := c.verifyControlPath(dialCtx, generation); err != nil {
 		return nil, err
 	}
+	// A reply on a new bidirectional stream can only arrive after the peer
+	// sees that stream. Retain its creation time as a conservative lower
+	// bound on that round trip, including if its response is read much later.
+	generation.probeMu.Lock()
+	proofStarted, proofEpoch := time.Now(), generation.proofEpoch
+	generation.probeMu.Unlock()
 	stream, err := generation.conn.OpenStreamSync(dialCtx)
 	if err != nil {
 		if generation.conn.Context().Err() != nil {
@@ -1524,6 +1531,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 	outer := &controlPoolStreamConn{
 		quicStreamConn: &quicStreamConn{stream: stream, conn: generation.conn, controller: generation.controller, closeConn: false, bulk: connBulkPath(generation.conn, c.memoryLimits.eventQueue)},
 		owner:          c, generation: generation,
+		proofStarted: proofStarted, proofEpoch: proofEpoch,
 	}
 	transferred = true
 	return outer, nil
@@ -1921,9 +1929,12 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 // off it.
 type controlPoolStreamConn struct {
 	*quicStreamConn
-	owner      *Client
-	generation *controlQUICGeneration
-	once       sync.Once
+	owner        *Client
+	generation   *controlQUICGeneration
+	proofStarted time.Time
+	proofEpoch   uint64
+	proofOnce    sync.Once
+	once         sync.Once
 }
 
 func (s *controlPoolStreamConn) transportFailed(err error) {
@@ -1931,9 +1942,7 @@ func (s *controlPoolStreamConn) transportFailed(err error) {
 		return
 	}
 	// A stream failure makes the next borrow prove the path, without killing siblings.
-	s.generation.probeMu.Lock()
-	s.generation.verified = time.Time{}
-	s.generation.probeMu.Unlock()
+	s.generation.invalidatePathProof()
 	// A stream deadline is not evidence that its sibling streams have failed.
 	if s.generation.conn.Context().Err() != nil {
 		s.owner.retireControlQUICGeneration(s.generation, "queqiao pooled connection failed")
@@ -2098,6 +2107,14 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				return
 			}
 			if len(flow.healthyLanes()) == 0 {
+				continue
+			}
+			if flow.openConfirmationRequired.Load() {
+				// A JOIN on another stream can overtake the optimistic OPEN
+				// and get an "unknown session" refusal for a flow still being
+				// established. Keep the original reliable stream and bounded
+				// OPEN deadline in charge until OPEN_OK arrives. Actual lane
+				// loss still takes the replacement path below.
 				continue
 			}
 			now := time.Now()

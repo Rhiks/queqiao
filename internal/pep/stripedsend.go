@@ -267,8 +267,9 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		// A lane carrying its data over coded datagrams does not retransmit
 		// for itself: the code repairs most loss and not all, and what it
 		// cannot repair has no other way back on a single-lane flow.
-		Reliable: f.laneRetransmits,
-		Windows:  &laneAdmission{flow: f},
+		Reliable:      f.laneRetransmits,
+		ForceReliable: f.recoverChunkReliably,
+		Windows:       &laneAdmission{flow: f},
 	})
 	defer sched.Close()
 

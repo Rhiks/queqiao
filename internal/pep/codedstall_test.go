@@ -34,6 +34,7 @@ func TestCodedSendStallRecoversOnExistingStream(t *testing.T) {
 	now := time.Now()
 	sched := stripe.New(bytes.NewReader([]byte("response")), stripe.Config{
 		Reliable:        func(uint64) bool { return !fc.codesData() },
+		ForceReliable:   flow.recoverChunkReliably,
 		RetransmitAfter: func() time.Duration { return time.Millisecond }, Now: func() time.Time { return now },
 	})
 	defer sched.Close()
@@ -60,6 +61,9 @@ func TestCodedSendStallRecoversOnExistingStream(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("no stall detected")
 	}
+	if !fc.codesData() {
+		t.Fatal("recovering old bytes disabled coding for fresh exchanges")
+	}
 	now = now.Add(time.Second)
 	if sched.ReissueExpired() != 1 {
 		t.Fatal("lost response was not reissued")
@@ -75,6 +79,15 @@ func TestCodedSendStallRecoversOnExistingStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	queued := <-lane.writeQ
+	// A delayed acknowledgement may arrive after dispatch but before the
+	// writer runs. It clears the byte-scoped recovery, but this retry's
+	// reliable snapshot must remain consistent with the scheduler.
+	if err = flow.acknowledgeReplay(retry.End(), false); err != nil {
+		t.Fatal(err)
+	}
+	if !fc.codesData() {
+		t.Fatal("acknowledged recovery permanently disabled coding for later exchanges")
+	}
 	if err = fc.writeContextMode(ctx, queued.frame, queued.forceReliable); err != nil {
 		t.Fatal(err)
 	}
@@ -87,4 +100,94 @@ func TestCodedSendStallRecoversOnExistingStream(t *testing.T) {
 		t.Fatal("response not delivered on stream")
 	}
 
+}
+
+func TestCodedRecoveryEndsAtTheStalledByteFrontier(t *testing.T) {
+	flow := newStallTestFlow(t, nil)
+	flow.noteSent(0, 8)
+	flow.escapePendingCoding()
+	if got := flow.codingRecoveryEnd.Load(); got != 8 {
+		t.Fatalf("recovery frontier = %d, want 8", got)
+	}
+	if !flow.recoverChunkReliably(0) || !flow.recoverChunkReliably(7) {
+		t.Fatal("stalled bytes were not pinned to stream recovery")
+	}
+	if flow.recoverChunkReliably(8) || !flow.prefersCodingOverRetransmission() {
+		t.Fatal("delayed feedback suppressed coding for a fresh exchange")
+	}
+	// Subsequent sends and repeated stall observations cannot move the
+	// recovery boundary indefinitely ahead of the acknowledgement.
+	flow.noteSent(8, 8)
+	flow.escapePendingCoding()
+	if got := flow.codingRecoveryEnd.Load(); got != 8 {
+		t.Fatalf("new traffic extended recovery frontier to %d", got)
+	}
+	if _, err := flow.acknowledgeCoverage(4, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !flow.recoverChunkReliably(4) {
+		t.Fatal("a partial acknowledgement abandoned the outstanding recovery")
+	}
+	if _, err := flow.acknowledgeCoverage(8, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if flow.recoverChunkReliably(0) {
+		t.Fatal("acknowledged recovery still forces reliable dispatch")
+	}
+	// A later, genuinely stalled exchange can enter recovery independently.
+	flow.escapePendingCoding()
+	if got := flow.codingRecoveryEnd.Load(); got != 16 {
+		t.Fatalf("next exchange's recovery frontier = %d, want 16", got)
+	}
+}
+
+func TestCodedRecoveryUsesValidatedSelectiveCoverage(t *testing.T) {
+	flow := newStallTestFlow(t, nil)
+	flow.noteSent(0, 8)
+	flow.escapePendingCoding()
+	if _, err := flow.acknowledgeCoverage(0, false, [][2]uint64{{4, 9}}); err == nil {
+		t.Fatal("accepted acknowledgement beyond the sent bytes")
+	}
+	if got := flow.codingRecoveryEnd.Load(); got != 8 {
+		t.Fatal("invalid acknowledgement changed coded recovery")
+	}
+	if _, err := flow.acknowledgeCoverage(0, false, [][2]uint64{{4, 8}}); err != nil {
+		t.Fatal(err)
+	}
+	if !flow.recoverChunkReliably(0) {
+		t.Fatal("selective coverage above a gap abandoned recovery")
+	}
+	// The range and the cumulative ACK together cover the original frontier,
+	// even though the cumulative field itself does not reach that frontier.
+	if _, err := flow.acknowledgeCoverage(4, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if flow.recoverChunkReliably(0) {
+		t.Fatal("complete selective coverage did not end coded recovery")
+	}
+	flow.escapePendingCoding()
+	if flow.codingRecoveryEnd.Load() != 0 {
+		t.Fatal("a stale watchdog scan restarted an already acknowledged recovery")
+	}
+}
+
+func TestCodedRecoveryCannotRaceAnAcknowledgement(t *testing.T) {
+	for range 100 {
+		flow := newStallTestFlow(t, nil)
+		flow.noteSent(0, 8)
+		start, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			<-start
+			flow.escapePendingCoding()
+			close(done)
+		}()
+		close(start)
+		if err := flow.acknowledgeReplay(8, false); err != nil {
+			t.Fatal(err)
+		}
+		<-done
+		if flow.codingRecoveryEnd.Load() != 0 {
+			t.Fatal("racing acknowledgement left completed recovery latched")
+		}
+	}
 }

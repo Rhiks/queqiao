@@ -13,6 +13,35 @@ import (
 // Remote proof freshness is independent of the local interface polling cadence.
 const pooledPathProofMaxAge = 2 * time.Second
 
+// Read records the first authenticated response on a newly opened stream.
+// Repeated short exchanges already prove the pooled connection works; ignoring
+// them would charge a redundant probe round trip every two seconds. Use the
+// stream's creation time, not the read time: old buffered bytes must not make
+// an idle connection appear freshly verified. Writes alone prove nothing.
+func (s *controlPoolStreamConn) Read(p []byte) (int, error) {
+	n, err := s.quicStreamConn.Read(p)
+	if n > 0 {
+		s.proofOnce.Do(func() {
+			g := s.generation
+			g.probeMu.Lock()
+			// A failure after this stream opened invalidates its evidence.
+			// A late response cannot undo the next borrow's required probe.
+			if s.proofEpoch == g.proofEpoch && s.proofStarted.After(g.verified) {
+				g.verified = s.proofStarted
+			}
+			g.probeMu.Unlock()
+		})
+	}
+	return n, err
+}
+
+func (g *controlQUICGeneration) invalidatePathProof() {
+	g.probeMu.Lock()
+	g.verified = time.Time{}
+	g.proofEpoch++
+	g.probeMu.Unlock()
+}
+
 // Borrowers share one round-trip check when the last real proof is stale.
 // Failure drains this generation: new borrowers get a fresh connection,
 // while existing siblings keep their transport until they finish.

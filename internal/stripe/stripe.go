@@ -137,6 +137,11 @@ type Config struct {
 	// single coded lane accumulates one admission charge per erasure and
 	// eventually cannot retry the bytes which are missing.
 	Reliable func(laneID uint64) bool
+	// ForceReliable pins selected byte ranges to a reliable carrier even when
+	// the lane normally uses datagrams. The decision is snapshotted at dispatch
+	// just like Reliable, so an in-flight recovery cannot change substrates
+	// when the policy later clears. Nil leaves the lane's decision unchanged.
+	ForceReliable func(offset uint64) bool
 	// Windows supplies admission limits. When nil, only LaneWindow and
 	// MaxOutstanding apply, which is the behaviour of a flow with no
 	// congestion coupling.
@@ -497,6 +502,9 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		}
 		id := s.nextAttempt
 		reliable := s.laneRetransmits(laneID)
+		if s.cfg.ForceReliable != nil && s.cfg.ForceReliable(chunk.Offset) {
+			reliable = true
+		}
 		out.attempts = append(out.attempts, attempt{
 			id: id, lane: laneID, deadline: deadline, reliable: reliable,
 		})
