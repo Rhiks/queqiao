@@ -172,6 +172,14 @@ assertions passed in that run, and its Go-source hashes remained unchanged.
 The subsequent calibration-pacer change is validated separately against the
 complete pathsim package rather than retroactively included in that result.
 
+The next ordinary CI on `ee03ed9` passed 20 of 22 jobs. Both Windows failures
+were in the new proof fixture's assumption that successive stream creation
+timestamps must differ. Equal timestamps are valid: the corrected fixture
+checks exact, nondecreasing proof values and unchanged epochs, including real
+authenticated equal-timestamp cases. It adds no sleep or timeout allowance.
+The in-progress deep run for that obsolete fixture was cancelled, with its
+completed results retained, before starting validation of the correction.
+
 ## Close acknowledgement follow-up
 
 A failed application write and a late source EOF could publish different close

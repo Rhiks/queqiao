@@ -149,10 +149,11 @@ func TestPooledStreamEmptyReadDoesNotConsumeRemoteProof(t *testing.T) {
 // timeouts and unclassified errors must still make the next borrower probe.
 func TestPooledStreamFailurePathProof(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		failure    func(*testing.T, *controlPoolStreamConn) error
-		err        error
-		invalidate bool
+		name              string
+		failure           func(*testing.T, *controlPoolStreamConn) error
+		err               error
+		invalidate        bool
+		equalProofStarted bool
 	}{
 		{name: "remote EOF", failure: pooledStreamRemoteEOF},
 		{name: "wrapped remote EOF", failure: func(t *testing.T, stream *controlPoolStreamConn) error {
@@ -200,6 +201,8 @@ func TestPooledStreamFailurePathProof(t *testing.T) {
 			}
 			return err
 		}},
+		{name: "equal timestamps remote EOF", failure: pooledStreamRemoteEOF, equalProofStarted: true},
+		{name: "equal timestamps unknown failure", err: errors.New("lane writer stopped"), invalidate: true, equalProofStarted: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
@@ -221,13 +224,27 @@ func TestPooledStreamFailurePathProof(t *testing.T) {
 			}
 			defer sibling.Close()
 			siblingStream := sibling.(*controlPoolStreamConn)
+			if test.equalProofStarted {
+				// Sequential stream creation can share a timestamp on coarse
+				// clocks. Exercise that case deterministically before the real
+				// authenticated response records the sibling's proof.
+				siblingStream.proofStarted = oldStream.proofStarted
+			}
 			pooledStreamProofRoundTrip(t, siblingStream)
 			g := oldStream.generation
 			g.probeMu.Lock()
 			verified, epoch := g.verified, g.proofEpoch
 			g.probeMu.Unlock()
-			if siblingStream.generation != g || !verified.Equal(siblingStream.proofStarted) || !verified.After(oldStream.proofStarted) {
-				t.Fatal("new sibling did not establish a newer authenticated path proof")
+			if siblingStream.generation != g {
+				t.Fatal("sibling unexpectedly used a different pooled generation")
+			}
+			if !verified.Equal(siblingStream.proofStarted) || verified.Before(oldStream.proofStarted) {
+				t.Fatalf("sibling proof = %v, sibling creation = %v, old creation = %v; want exact nondecreasing proof",
+					verified, siblingStream.proofStarted, oldStream.proofStarted)
+			}
+			if oldStream.proofEpoch != epoch || siblingStream.proofEpoch != epoch {
+				t.Fatalf("proof epochs: old=%d sibling=%d generation=%d; want one unchanged epoch",
+					oldStream.proofEpoch, siblingStream.proofEpoch, epoch)
 			}
 
 			failure := test.err
