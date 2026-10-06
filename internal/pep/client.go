@@ -2611,6 +2611,23 @@ func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessio
 	hint := flow.rescueHint.Load()
 	if hint != nil {
 		ctx = context.WithValue(ctx, laneReplacementContextKey{}, *hint)
+		// An acknowledged JOIN on the stalled connection is not a new path:
+		// it inherits the same congestion and loss state. Drain only the
+		// generation owning the suspected lane so recovery coalesces on a
+		// fresh connection. Existing sibling flows retain their transport;
+		// a late rescue from the old generation cannot drain its successor.
+		flow.lanesMu.RLock()
+		lane := flow.lanes[hint.id]
+		var stalled *controlQUICGeneration
+		if lane != nil && lane.suspected.Load() && lane.fc != nil {
+			if outer, ok := lane.fc.transport().(*controlPoolStreamConn); ok {
+				stalled = outer.generation
+			}
+		}
+		flow.lanesMu.RUnlock()
+		if stalled != nil {
+			c.drainControlQUICGeneration(stalled)
+		}
 	}
 	flow.rescueInFlight.Store(true)
 	err := c.openParallelRescue(ctx, flow, sessionID, flowID)
