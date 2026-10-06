@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 )
 
 const (
@@ -332,6 +333,9 @@ func AppendFrame(dst []byte, f Frame) ([]byte, error) {
 	}
 	f.Header.PayloadLen = uint32(len(f.Payload))
 	start := len(dst)
+	// Reserve both parts together; a fresh coded frame must not allocate once
+	// for the header and then again for the payload.
+	dst = slices.Grow(dst, HeaderSize+len(f.Payload))
 	dst = append(dst, make([]byte, HeaderSize)...)
 	if err := f.Header.Encode(dst[start:]); err != nil {
 		return dst[:start], err

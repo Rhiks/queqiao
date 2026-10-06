@@ -232,6 +232,18 @@ func (p *Path) Send(frame []byte) error {
 }
 
 func (p *Path) SendContext(ctx context.Context, frame []byte) error {
+	return p.sendContext(ctx, frame, true)
+}
+
+// SendOwnedContext queues a frame whose backing array belongs exclusively to
+// the caller. A successful send transfers ownership to the path; the caller
+// must not read, mutate, or reuse it afterward. SendContext keeps its copying
+// contract for callers that retain their buffers.
+func (p *Path) SendOwnedContext(ctx context.Context, frame []byte) error {
+	return p.sendContext(ctx, frame, false)
+}
+
+func (p *Path) sendContext(ctx context.Context, frame []byte, copyFrame bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -246,8 +258,11 @@ func (p *Path) SendContext(ctx context.Context, frame []byte) error {
 		return p.failure()
 	default:
 	}
-	queued := make([]byte, len(frame))
-	copy(queued, frame)
+	queued := frame
+	if copyFrame {
+		queued = make([]byte, len(frame))
+		copy(queued, frame)
+	}
 	select {
 	case p.pending <- queued:
 		return nil

@@ -334,7 +334,9 @@ func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame) error {
 	if err != nil {
 		return err
 	}
-	if err := c.bulk.SendContext(ctx, buf); err != nil {
+	// AppendFrame(nil, f) owns this fresh buffer. Transfer it instead of
+	// copying a complete serialized frame a second time into the queue.
+	if err := c.bulk.SendOwnedContext(ctx, buf); err != nil {
 		return c.writeControlContext(ctx, f)
 	}
 	c.countData(f, true)
