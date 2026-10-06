@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -1941,12 +1942,40 @@ func (s *controlPoolStreamConn) transportFailed(err error) {
 	if s.generation == nil {
 		return
 	}
-	// A stream failure makes the next borrow prove the path, without killing siblings.
-	s.generation.invalidatePathProof()
-	// A stream deadline is not evidence that its sibling streams have failed.
+	// Check the connection before exempting stream teardown: an old EOF must
+	// never hide a real failure of the generation which carried it.
 	if s.generation.conn.Context().Err() != nil {
+		s.generation.invalidatePathProof()
 		s.owner.retireControlQUICGeneration(s.generation, "queqiao pooled connection failed")
+		return
 	}
+	// FIN and our code-0 stream cancellation are stream lifecycle, not a
+	// failed path. In particular, a late close from an old flow must not erase
+	// a newer sibling's authenticated proof. Neither outcome renews it.
+	if pooledStreamLifecycleEnd(err) {
+		return
+	}
+	// Deadlines, nonzero cancellations, and unknown errors still require a
+	// bounded probe on the next borrow without killing healthy siblings.
+	s.generation.invalidatePathProof()
+}
+
+func pooledStreamLifecycleEnd(err error) bool {
+	if pooledTransportTimedOut(err) {
+		return false
+	}
+	// Follow single-cause wrappers only. A joined error can also carry a
+	// timeout or unknown failure, so matching one lifecycle cause is unsafe.
+	for err != nil {
+		if err == io.EOF {
+			return true
+		}
+		if streamErr, ok := err.(*quic.StreamError); ok {
+			return streamErr.ErrorCode == 0
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 func pooledTransportTimedOut(err error) bool {

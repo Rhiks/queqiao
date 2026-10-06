@@ -288,6 +288,11 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	}
 	payload := make([]byte, h.PayloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
+		// A header already started this frame. EOF before even the first
+		// payload byte is truncation, not a clean end between frames.
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return Frame{}, err
 	}
 	return Frame{Header: h, Payload: payload}, nil

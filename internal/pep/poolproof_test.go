@@ -1,12 +1,16 @@
 package pep
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/apernet/quic-go"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -137,5 +141,212 @@ func TestPooledStreamEmptyReadDoesNotConsumeRemoteProof(t *testing.T) {
 		if !g.verified.Equal(lane.proofStarted) {
 			t.Fatal("an empty read consumed the first positive response")
 		}
+	}
+}
+
+// Teardown from an older stream can arrive after a sibling has proved the
+// path. Only known stream lifecycle outcomes may retain that proof; actual
+// timeouts and unclassified errors must still make the next borrower probe.
+func TestPooledStreamFailurePathProof(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		failure    func(*testing.T, *controlPoolStreamConn) error
+		err        error
+		invalidate bool
+	}{
+		{name: "remote EOF", failure: pooledStreamRemoteEOF},
+		{name: "wrapped remote EOF", failure: func(t *testing.T, stream *controlPoolStreamConn) error {
+			return fmt.Errorf("lane read: %w", pooledStreamRemoteEOF(t, stream))
+		}},
+		{name: "local zero-code cancellation", failure: func(t *testing.T, stream *controlPoolStreamConn) error {
+			stream.stream.CancelRead(0)
+			_, err := stream.Read(make([]byte, 1))
+			var streamErr *quic.StreamError
+			if !errors.As(err, &streamErr) || streamErr.Remote || streamErr.ErrorCode != 0 {
+				t.Fatalf("local close error = %v, want local code-0 stream cancellation", err)
+			}
+			return err
+		}},
+		{name: "remote zero-code cancellation", err: &quic.StreamError{Remote: true}},
+		{name: "wrapped remote zero-code cancellation", err: fmt.Errorf("lane write: %w", &quic.StreamError{Remote: true})},
+		{name: "remote nonzero cancellation", err: &quic.StreamError{Remote: true, ErrorCode: 1}, invalidate: true},
+		{name: "local nonzero cancellation", err: &quic.StreamError{ErrorCode: 1}, invalidate: true},
+		{name: "unknown failure", err: errors.New("lane writer stopped"), invalidate: true},
+		{name: "truncated frame", err: io.ErrUnexpectedEOF, invalidate: true},
+		{name: "parser missing payload", invalidate: true, failure: func(t *testing.T, _ *controlPoolStreamConn) error {
+			encoded, err := protocol.AppendFrame(nil, protocol.Frame{
+				Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeData}, Payload: []byte("payload"),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = protocol.ReadFrame(bytes.NewReader(encoded[:protocol.HeaderSize]))
+			if err == nil {
+				t.Fatal("parser accepted a frame with its entire payload missing")
+			}
+			return fmt.Errorf("lane read: %w", err)
+		}},
+		{name: "EOF with unknown failure", err: errors.Join(io.EOF, errors.New("lane writer stopped")), invalidate: true},
+		{name: "zero-code cancellation with unknown failure", err: errors.Join(&quic.StreamError{Remote: true}, errors.New("lane writer stopped")), invalidate: true},
+		{name: "wrapped timeout", err: fmt.Errorf("lane read: %w", context.DeadlineExceeded), invalidate: true},
+		{name: "timeout with EOF", err: errors.Join(io.EOF, context.DeadlineExceeded), invalidate: true},
+		{name: "stream read timeout", invalidate: true, failure: func(t *testing.T, stream *controlPoolStreamConn) error {
+			if err := stream.SetDeadline(time.Now().Add(-time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			_, err := stream.Read(make([]byte, 1))
+			if !pooledTransportTimedOut(err) {
+				t.Fatalf("expired stream read = %v, want timeout", err)
+			}
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+			c := rig.client
+			t.Cleanup(c.closeQUICPool)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cc := congestionConfig{kind: defaultCongestion()}
+			old, err := c.dialPooledQUICLane(ctx, cc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer old.Close()
+			oldStream := old.(*controlPoolStreamConn)
+			pooledStreamProofRoundTrip(t, oldStream)
+			sibling, err := c.dialPooledQUICLane(ctx, cc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sibling.Close()
+			siblingStream := sibling.(*controlPoolStreamConn)
+			pooledStreamProofRoundTrip(t, siblingStream)
+			g := oldStream.generation
+			g.probeMu.Lock()
+			verified, epoch := g.verified, g.proofEpoch
+			g.probeMu.Unlock()
+			if siblingStream.generation != g || !verified.Equal(siblingStream.proofStarted) || !verified.After(oldStream.proofStarted) {
+				t.Fatal("new sibling did not establish a newer authenticated path proof")
+			}
+
+			failure := test.err
+			if test.failure != nil {
+				failure = test.failure(t, oldStream)
+			}
+			oldStream.transportFailed(failure)
+			g.probeMu.Lock()
+			after, afterEpoch := g.verified, g.proofEpoch
+			g.probeMu.Unlock()
+			if test.invalidate {
+				if !after.IsZero() || afterEpoch != epoch+1 {
+					t.Fatalf("failure retained path proof: verified=%v, epoch=%d (was %d)", after, afterEpoch, epoch)
+				}
+			} else if !after.Equal(verified) || afterEpoch != epoch {
+				t.Fatalf("stream teardown discarded newer sibling proof: verified=%v (was %v), epoch=%d (was %d)", after, verified, afterEpoch, epoch)
+			}
+			if g.conn.Context().Err() != nil {
+				t.Fatal("stream-local outcome closed sibling connection")
+			}
+
+			var probes atomic.Int32
+			var bounded atomic.Bool
+			c.probeControlGenerationForTest = func(probeCtx context.Context, generation *controlQUICGeneration, budget time.Duration) error {
+				probes.Add(1)
+				deadline, ok := probeCtx.Deadline()
+				bounded.Store(ok && time.Until(deadline) > 0 && time.Until(deadline) <= c.cfg.HandshakeTimeout && budget == c.cfg.HandshakeTimeout)
+				return probeControlGeneration(probeCtx, generation, budget)
+			}
+			next, err := c.dialPooledQUICLane(ctx, cc)
+			if err != nil {
+				t.Fatalf("borrow after stream-local outcome: %v", err)
+			}
+			defer next.Close()
+			if next.(*controlPoolStreamConn).generation != g {
+				t.Fatal("stream-local outcome replaced healthy generation")
+			}
+			if test.invalidate {
+				if probes.Load() != 1 || !bounded.Load() {
+					t.Fatalf("next borrow used %d probes, bounded=%v; want one bounded probe", probes.Load(), bounded.Load())
+				}
+			} else if got := probes.Load(); got != 0 {
+				t.Fatalf("ordinary stream teardown charged next borrower %d unnecessary probes", got)
+			}
+		})
+	}
+}
+
+func pooledStreamProofRoundTrip(t *testing.T, stream *controlPoolStreamConn) {
+	t.Helper()
+	if err := stream.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	fc := newFrameConn(stream)
+	frame := protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeProbe,
+		SessionID: [16]byte{1}, Class: protocol.ClassNew,
+	}, Payload: []byte{1}}
+	if err := fc.Write(frame); err != nil {
+		t.Fatal(err)
+	}
+	response, err := fc.Read()
+	if err != nil || response.Header.SessionID != frame.Header.SessionID || response.Header.Type != frame.Header.Type {
+		t.Fatalf("proof response = %+v, error = %v", response.Header, err)
+	}
+}
+
+func pooledStreamRemoteEOF(t *testing.T, stream *controlPoolStreamConn) error {
+	t.Helper()
+	if err := stream.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := stream.Read(make([]byte, 1))
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("finished remote stream = %v, want EOF", err)
+	}
+	return err
+}
+
+func TestPooledConnectionFailureRetiresEvenAfterStreamEOF(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	c := rig.client
+	t.Cleanup(c.closeQUICPool)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cc := congestionConfig{kind: defaultCongestion()}
+	outer, err := c.dialPooledQUICLane(ctx, cc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outer.Close()
+	old := outer.(*controlPoolStreamConn)
+	g := old.generation
+	if err := g.conn.CloseWithError(0, "test connection failure"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-g.conn.Context().Done():
+	case <-ctx.Done():
+		t.Fatal("failed connection context was not canceled")
+	}
+	old.transportFailed(fmt.Errorf("late stream EOF: %w", io.EOF))
+	c.quicMu.Lock()
+	current := c.quicGeneration
+	c.quicMu.Unlock()
+	if current != nil {
+		t.Fatal("stream EOF hid a failed pooled connection")
+	}
+	next, err := c.dialPooledQUICLane(ctx, cc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	fresh := next.(*controlPoolStreamConn).generation
+	old.transportFailed(&quic.StreamError{Remote: true})
+	c.quicMu.Lock()
+	current = c.quicGeneration
+	c.quicMu.Unlock()
+	if fresh == g || current != fresh || fresh.conn.Context().Err() != nil {
+		t.Fatal("late stream failure affected replacement generation")
 	}
 }

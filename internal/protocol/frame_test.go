@@ -50,6 +50,45 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReadFrameEOFBoundaries(t *testing.T) {
+	encoded, err := AppendFrame(nil, Frame{
+		Header: Header{Version: Version, Type: TypeData}, Payload: []byte("abc"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name  string
+		bytes int
+		want  error
+	}{
+		{name: "empty input", want: io.EOF},
+		{name: "partial header", bytes: HeaderSize - 1, want: io.ErrUnexpectedEOF},
+		{name: "missing payload", bytes: HeaderSize, want: io.ErrUnexpectedEOF},
+		{name: "partial payload", bytes: HeaderSize + 1, want: io.ErrUnexpectedEOF},
+		{name: "complete frame", bytes: len(encoded)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ReadFrame(bytes.NewReader(encoded[:test.bytes]))
+			if !errors.Is(err, test.want) {
+				t.Fatalf("ReadFrame after %d bytes = %v, want %v", test.bytes, err, test.want)
+			}
+		})
+	}
+	// A legal empty-payload frame still completes before the following EOF.
+	empty, err := AppendFrame(nil, Frame{Header: Header{Version: Version, Type: TypeClose}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := bytes.NewReader(empty)
+	if _, err := ReadFrame(r); err != nil {
+		t.Fatalf("empty-payload frame: %v", err)
+	}
+	if _, err := ReadFrame(r); !errors.Is(err, io.EOF) {
+		t.Fatalf("EOF between complete frames = %v, want EOF", err)
+	}
+}
+
 func TestWriteFrameHandlesShortWrites(t *testing.T) {
 	var sid [16]byte
 	f := Frame{Header: Header{Version: Version, Type: TypeData, SessionID: sid, FlowID: 7, Sequence: 3, Class: ClassBulk}, Payload: []byte("short writes are valid")}
