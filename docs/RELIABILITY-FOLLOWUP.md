@@ -84,7 +84,8 @@ Once OPEN is confirmed, established-flow refusals retain their terminal meaning.
 
 ### Validation and remaining short-flow limit
 
-The October 6 follow-up used Go 1.25.13 on Linux/amd64. The unchanged
+The initial October 6 follow-up, commit `5dd4b4c`, used Go 1.25.13 on
+Linux/amd64. The unchanged
 small-exchange integration test passed five native and five race runs, with
 known-path medians of 303--311 ms on the 300 ms, 42% erasure path. The warm-pool
 test now covers six warm flows at its unchanged latency bound. Deterministic
@@ -107,6 +108,69 @@ The test also omits failed response reads from its latency samples, so its
 survivor median must be read together with completion counts. These fixes do
 not protect OPEN with coding, relax that timing assertion, or establish a WAN
 latency improvement.
+
+The [ordinary hosted CI](https://github.com/bojieli/queqiao/actions/runs/37427193475)
+for `5dd4b4c` passed all 22 jobs. Its [on-demand deep campaign](https://github.com/Rhiks/queqiao/actions/runs/37427392775)
+completed with eight passing and eight failing jobs. The warm-pool
+and learned-path exchange failures did not recur. Remaining failures included
+short-flow latency, receive-loss finalization, premature recovery fault
+injection, RTT-baseline arithmetic, and one macOS-Intel race calibration with
+additional bottleneck drops. These results are recorded separately from the
+local container's permission limitations.
+
+### Bounded proof and test-integrity follow-up
+
+A normal EOF or code-zero QUIC stream cancellation on a live connection does
+not invalidate a newer sibling's existing path proof. It does not renew that
+proof either. A failed connection still retires its own generation first;
+timeouts, nonzero cancellations, unknown errors and mixed error chains still
+require validation. Framing now distinguishes clean EOF between frames from
+EOF after a header promised payload, which remains a truncated-frame error.
+
+The follow-up tests keep their existing performance bounds while measuring the
+states those bounds require:
+
+- Short-flow attempts retain errors and byte counts. Failed attempts fail the
+  test instead of disappearing from a survivor-only latency distribution.
+  Matched request IDs separate local SOCKS acknowledgement, remote destination
+  admission, request arrival and completed end-to-end latency. The 900 ms
+  end-to-end median assertion remains in force.
+- A partially occupied FEC decoder window can contain erased symbols whose
+  outcomes are not yet final. The degradation test still checks the measured
+  path and published received symbols. A deterministic test now forces both a
+  real repair and window-expired loss through transport statistics, shared
+  connection accounting, the registry and HTTP metrics.
+- The TCP-rescue test proves an application round trip before removing the
+  initial QUIC lane. Session registration alone precedes OPEN_OK and did not
+  establish the recovery scenario that the test claimed to exercise.
+- The policer characterization requires positive RTT and minimum-RTT readings
+  before subtracting them. An unknown minimum of zero otherwise manufactures
+  100--303 ms of apparent queue. No valid readings is a failure, and the 50 ms
+  queue bound and existing brake/overdrive assertions remain unchanged. The
+  exact historical hosted sample cannot be reconstructed from its old log;
+  genuine scheduling noise can still affect this characterization.
+- The open-loop calibration sender no longer repays unlimited scheduling debt
+  in a burst. It expires excess credit beyond eight packets and reports actual
+  offered rate and discarded entitlement alongside the target. Sequence IDs
+  remain contiguous for packets actually sent. The fixed measurement duration,
+  delivered-rate bounds and loss-structure checks are unchanged; throughput is
+  not rescaled to conceal a host that underoffers. A deterministic 330 ms sender
+  pause reproduces the former below-knee tail-drop pattern. A pause in the
+  relay's own socket reader can still bunch arrivals, so this sender correction
+  does not establish that every noisy host can run the calibration faithfully.
+
+Focused proof/parser tests passed ten race repetitions and 100,000 parser-fuzz
+inputs. The receive-metric test passed 100 ordinary and ten race repetitions,
+and the degradation integration passed three runs. Recovery-fixture tests
+passed twenty ordinary and ten race repetitions. These are bounded regression
+results, not a claim that extreme-loss short-flow latency or WAN reliability
+is resolved.
+
+A second serialized full Go run with the proof/parser and test-integrity
+changes recorded only the same seven container permission failures; all other
+assertions passed in that run, and its Go-source hashes remained unchanged.
+The subsequent calibration-pacer change is validated separately against the
+complete pathsim package rather than retroactively included in that result.
 
 ## Close acknowledgement follow-up
 
