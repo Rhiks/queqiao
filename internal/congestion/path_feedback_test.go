@@ -58,3 +58,40 @@ func TestSharedPathReportsAcknowledgedDeliveryNotInheritedPacing(t *testing.T) {
 		t.Fatal("small app-limited exchange discarded the useful pacing seed")
 	}
 }
+
+func TestSmallAppLimitedExchangesDoNotCapSharedPath(t *testing.T) {
+	m := pathmodel.NewPathModel()
+	now := monotime.Now()
+	for i := 0; i < 2; i++ {
+		e := NewErasureSenderOn(1200, m)
+		e.inner.estimator.markAppLimited()
+		e.OnPacketSent(now, 0, 1, 1200, true)
+		e.OnCongestionEventEx(1200, now.Add(100*time.Millisecond), []quiccongestion.AckedPacketInfo{
+			{PacketNumber: 1, BytesAcked: 1200},
+		}, nil)
+		e.OnCongestionEventEx(0, now.Add(101*time.Millisecond), nil, nil)
+		if got := e.Share(); got != 0 {
+			t.Fatalf("small exchange created a shared capacity ceiling of %.0f bytes/s", got)
+		}
+	}
+	state := m.Current()
+	if state.Share != 0 {
+		t.Fatalf("new transfer inherited a %.0f bytes/s ceiling from small exchanges", state.Share)
+	}
+	if state.Seed <= 0 {
+		t.Fatal("useful measured delivery was discarded instead of remaining a seed")
+	}
+}
+
+func TestIdleMembersDoNotDivideSaturatedPathShare(t *testing.T) {
+	m := pathmodel.NewPathModel()
+	m.Report(1, pathmodel.Observation{Delivered: 1000, AppLimited: true})
+	first := m.Report(2, pathmodel.Observation{Delivered: 1_000_000})
+	if first.Share != 0 {
+		t.Fatalf("single busy sender was capped at %.0f by an idle sibling", first.Share)
+	}
+	second := m.Report(3, pathmodel.Observation{Delivered: 1_000_000})
+	if second.Share < 1_200_000 || second.Share > 1_300_000 {
+		t.Fatalf("two busy senders received share %.0f, want an even split with probe headroom", second.Share)
+	}
+}

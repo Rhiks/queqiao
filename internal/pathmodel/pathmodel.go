@@ -80,12 +80,13 @@ type pathKnowledge struct {
 type Member uint64
 
 type report struct {
-	erasure   float64
-	burst     float64
-	observed  float64
-	delivered float64
-	roundTrip time.Duration
-	at        time.Time
+	erasure    float64
+	burst      float64
+	observed   float64
+	delivered  float64
+	appLimited bool
+	roundTrip  time.Duration
+	at         time.Time
 }
 
 // Observation is what one contributor has measured about the direction it
@@ -113,6 +114,10 @@ type Observation struct {
 	// RoundTrip the smallest round trip it has seen.
 	Delivered float64
 	RoundTrip time.Duration
+	// AppLimited means delivery was limited by available application data or
+	// the sender has not established a bottleneck yet. It can seed a joining
+	// lane, but cannot establish a capacity ceiling for one.
+	AppLimited bool
 }
 
 // State is what an endpoint pair has been measured to do, from the point of
@@ -150,8 +155,9 @@ type State struct {
 }
 
 type bandwidthSample struct {
-	rate float64
-	at   time.Time
+	rate          float64
+	at            time.Time
+	capacityKnown bool
 }
 
 const (
@@ -210,6 +216,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 	entry.erasure, entry.burst = o.Erasure, o.BurstFactor
 	entry.observed, entry.delivered, entry.at = o.ObservedSamples, o.Delivered, now
+	entry.appLimited = o.AppLimited
 	if o.RoundTrip > 0 {
 		entry.roundTrip = o.RoundTrip
 	}
@@ -218,12 +225,16 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	var observed, sum float64
 	var erasureWeighted, burstWeighted float64
 	live := 0
+	busy := 0
 	for key, other := range m.members {
 		if now.Sub(other.at) > memberIdle {
 			delete(m.members, key)
 			continue
 		}
 		live++
+		if !other.appLimited && other.delivered > 0 {
+			busy++
+		}
 		sum += other.delivered
 		// A lane with few samples should not move the pooled estimate much,
 		// which is also what lets a new lane join without disturbing it.
@@ -259,9 +270,10 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 
 	if sum > 0 {
-		m.aggregate = append(m.aggregate, bandwidthSample{rate: sum, at: now})
+		m.aggregate = append(m.aggregate, bandwidthSample{rate: sum, at: now, capacityKnown: busy > 0})
 	}
 	bottleneck := 0.0
+	capacity := 0.0
 	kept := m.aggregate[:0]
 	for _, sample := range m.aggregate {
 		if now.Sub(sample.at) > bottleneckWindow {
@@ -270,6 +282,9 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		kept = append(kept, sample)
 		if sample.rate > bottleneck {
 			bottleneck = sample.rate
+		}
+		if sample.capacityKnown && sample.rate > capacity {
+			capacity = sample.rate
 		}
 	}
 	m.aggregate = kept
@@ -283,8 +298,8 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		// never probe past it. Measured, that is a transport that runs at line
 		// rate and then collapses to a fiftieth of it for the rest of the
 		// process's life.
-		if live > 1 {
-			state.Share = shareProbeGain * state.Seed
+		if !o.AppLimited && busy > 1 && capacity > 0 {
+			state.Share = shareProbeGain * capacity / float64(busy)
 		}
 	}
 	return state
@@ -306,15 +321,19 @@ func (m *PathModel) Current() State {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var state State
-	var observed, bottleneck float64
+	var observed, bottleneck, capacity float64
 	var erasureWeighted, burstWeighted float64
 	live := 0
+	busy := 0
 	for key, entry := range m.members {
 		if now.Sub(entry.at) > memberIdle {
 			delete(m.members, key)
 			continue
 		}
 		live++
+		if !entry.appLimited && entry.delivered > 0 {
+			busy++
+		}
 		erasureWeighted += entry.erasure * entry.observed
 		burstWeighted += entry.burst * entry.observed
 		observed += entry.observed
@@ -346,8 +365,13 @@ func (m *PathModel) Current() State {
 		state.RoundTrip = m.knowledge.roundTrip
 	}
 	for _, sample := range m.aggregate {
-		if now.Sub(sample.at) <= bottleneckWindow && sample.rate > bottleneck {
-			bottleneck = sample.rate
+		if now.Sub(sample.at) <= bottleneckWindow {
+			if sample.rate > bottleneck {
+				bottleneck = sample.rate
+			}
+			if sample.capacityKnown && sample.rate > capacity {
+				capacity = sample.rate
+			}
 		}
 	}
 	if bottleneck > 0 {
@@ -358,8 +382,8 @@ func (m *PathModel) Current() State {
 		// it. A lane joining an empty model is alone, and capping it at what
 		// the last occupant delivered is how a fresh connection inherits a
 		// dead one's collapse.
-		if live > 0 {
-			state.Share = shareProbeGain * state.Seed
+		if busy > 0 && capacity > 0 {
+			state.Share = shareProbeGain * capacity / float64(busy+1)
 		}
 	}
 	return state

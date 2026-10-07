@@ -601,8 +601,9 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 			ObservedSamples: float64(snapshot.Decided),
 			// Pacing includes probing gain, and the controller's model can
 			// include an inherited seed. Neither is new delivered capacity.
-			Delivered: float64(e.inner.estimator.measuredFilter.get()),
-			RoundTrip: e.inner.minRoundTrip(),
+			Delivered:  float64(e.inner.estimator.measuredFilter.get()),
+			RoundTrip:  e.inner.minRoundTrip(),
+			AppLimited: e.inner.lastSampleAppLimited || !e.inner.fullBandwidth,
 		})
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
