@@ -175,11 +175,9 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 		// expensive part, and a lane opened to replace one that died would
 		// otherwise pay it again on a path nothing has forgotten.
 		//
-		// What is seeded is the delivered rate, compensated for the erasure --
-		// which is what this sender puts on the wire to deliver it. BBR sizes
-		// both its pacing and its window from that one number, so seeding it
-		// moves both; seeding a pacing rate alone leaves the window at the
-		// initial one and the pacer waiting on it.
+		// Seed the delivered rate. This wrapper compensates both pacing and
+		// the window for erasure when they are used; compensating the seed too
+		// would count the same loss twice.
 		//
 		// The seed and the cap are separate: a lane joining a path that is
 		// already occupied takes both, and a lane that is alone takes the
@@ -199,7 +197,7 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 			if state.Share > 0 {
 				e.share.Store(uint64(state.Share))
 			}
-			e.inner.seedBandwidth(uint64(state.Seed/e.arrivalRate()), state.RoundTrip)
+			e.inner.seedBandwidth(uint64(state.Seed), state.RoundTrip)
 		}
 	}
 	return e
@@ -601,8 +599,10 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		state := e.path.Report(e.id(), pathmodel.Observation{
 			Erasure: snapshot.Loss, BurstFactor: snapshot.BurstFactor,
 			ObservedSamples: float64(snapshot.Decided),
-			Delivered:       float64(e.inner.bandwidth()),
-			RoundTrip:       e.inner.minRoundTrip(),
+			// Pacing includes probing gain, and the controller's model can
+			// include an inherited seed. Neither is new delivered capacity.
+			Delivered: float64(e.inner.estimator.measuredFilter.get()),
+			RoundTrip: e.inner.minRoundTrip(),
 		})
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))

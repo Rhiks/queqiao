@@ -62,8 +62,12 @@ type tuicBandwidthEstimator struct {
 	appLimited        bool
 	endAppLimitedAt   quiccongestion.PacketNumber
 	maxFilter         tuicMinMax
-	ackedAtWindow     uint64
-	packetStates      map[quiccongestion.PacketNumber]tuicPacketState
+	// measuredFilter contains only ACK-derived delivery. maxFilter can also
+	// inherit a path seed; feeding that seed back to the shared path would
+	// count borrowed capacity as new evidence whenever a lane is replaced.
+	measuredFilter tuicMinMax
+	ackedAtWindow  uint64
+	packetStates   map[quiccongestion.PacketNumber]tuicPacketState
 	// lowestState is the smallest packet number that may still be present in
 	// packetStates. Packet numbers only increase, so it turns removeObsolete
 	// from a scan of everything in flight into a walk of what is actually
@@ -110,6 +114,7 @@ func newTUICBandwidthEstimator() tuicBandwidthEstimator {
 		lastSentPacket:  quiccongestion.PacketNumber(-1),
 		endAppLimitedAt: quiccongestion.PacketNumber(-1),
 		maxFilter:       newTUICMinMax(),
+		measuredFilter:  newTUICMinMax(),
 		packetStates:    make(map[quiccongestion.PacketNumber]tuicPacketState),
 	}
 }
@@ -393,12 +398,14 @@ func (e *tuicBandwidthEstimator) onAckBatch(eventTime monotime.Time, acked []qui
 	// connection that is application limited essentially always -- 99.98% of
 	// samples on the path this was measured against -- that exception is the
 	// only way the estimate ever comes down.
-	if result.maxBandwidth > 0 &&
-		(!result.sampleAppLimited || result.maxBandwidth > e.maxFilter.get() || e.maxFilter.stale(eventTime)) {
-		if result.minRTT > 0 {
-			e.maxFilter.setRoundTrip(result.minRTT)
+	for _, filter := range []*tuicMinMax{&e.maxFilter, &e.measuredFilter} {
+		if result.maxBandwidth > 0 &&
+			(!result.sampleAppLimited || result.maxBandwidth > filter.get() || filter.stale(eventTime)) {
+			if result.minRTT > 0 {
+				filter.setRoundTrip(result.minRTT)
+			}
+			filter.updateMax(round, eventTime, result.maxBandwidth)
 		}
-		e.maxFilter.updateMax(round, eventTime, result.maxBandwidth)
 	}
 	return result
 }
@@ -431,6 +438,7 @@ func (e *tuicBandwidthEstimator) onAck(now monotime.Time, bytes, round uint64, a
 		// packet numbers, and carry no event time; a zero leaves the sample on
 		// the round clock alone.
 		e.maxFilter.updateMax(round, monotime.Time(0), minUint64(sendRate, ackRate))
+		e.measuredFilter.updateMax(round, monotime.Time(0), minUint64(sendRate, ackRate))
 	}
 }
 
