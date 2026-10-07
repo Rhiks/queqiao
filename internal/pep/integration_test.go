@@ -1068,6 +1068,15 @@ func TestLostFinalFINUsesOneTombstoneRescueWithoutStorm(t *testing.T) {
 }
 
 func TestFullApplicationCloseAbortsKeepAliveDestination(t *testing.T) {
+	runFullApplicationCloseAbortsKeepAliveDestination(t, TransportTCP)
+}
+
+func TestFullApplicationCloseQUICAbortsKeepAliveDestination(t *testing.T) {
+	runFullApplicationCloseAbortsKeepAliveDestination(t, TransportQUIC)
+}
+
+func runFullApplicationCloseAbortsKeepAliveDestination(t *testing.T, transport TransportKind) {
+	t.Helper()
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1084,14 +1093,21 @@ func TestFullApplicationCloseAbortsKeepAliveDestination(t *testing.T) {
 			t.Logf("full-close trace:\n%s", logBuf.String())
 		}
 	})
-	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
+	var serverListener net.Listener
+	var serverPacketConn net.PacketConn
+	if transport == TransportQUIC {
+		serverPacketConn, err = net.ListenPacket("udp", "127.0.0.1:0")
+	} else {
+		serverListener, err = net.Listen("tcp", "127.0.0.1:0")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
+	serverAddr := serverListenerAddr(serverListener, serverPacketConn)
 	serverMetrics := metrics.New()
 	server, err := NewServer(ServerConfig{
-		ListenAddr: serverListener.Addr().String(), Credentials: certificate,
-		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: true, EnableQUIC: false,
+		ListenAddr: serverAddr, Credentials: certificate,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: transport != TransportQUIC, EnableQUIC: transport != TransportTCP,
 		Logger: logger, Metrics: serverMetrics,
 	})
 	if err != nil {
@@ -1103,7 +1119,7 @@ func TestFullApplicationCloseAbortsKeepAliveDestination(t *testing.T) {
 	}
 	clientMetrics := metrics.New()
 	client, err := NewClient(ClientConfig{
-		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverListener.Addr().String(), Credentials: roots, Transport: TransportTCP, Logger: logger, Metrics: clientMetrics,
+		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverAddr, Credentials: roots, Transport: transport, EnableQUICPool: transport == TransportQUIC, Logger: logger, Metrics: clientMetrics,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1111,7 +1127,11 @@ func TestFullApplicationCloseAbortsKeepAliveDestination(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errorsCh := make(chan error, 2)
-	go func() { errorsCh <- server.ServeListener(ctx, serverListener) }()
+	if transport == TransportQUIC {
+		go func() { errorsCh <- server.ServePacketConn(ctx, serverPacketConn) }()
+	} else {
+		go func() { errorsCh <- server.ServeListener(ctx, serverListener) }()
+	}
 	go func() { errorsCh <- client.ServeListener(ctx, clientListener) }()
 
 	conn := dialTestSOCKS(t, clientListener.Addr().String(), destinationListener.Addr().String())
@@ -1336,15 +1356,30 @@ func holdResponseDestination(listener net.Listener, response []byte) {
 		}
 		go func() {
 			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 			if err := writeFull(conn, response); err != nil {
 				return
 			}
-			// Drain the request and keep the destination socket alive until the
-			// proxy receives the application's full-close marker and closes this
-			// connection. Reading only one request byte leaves unread receive
-			// data; Windows correctly turns a close in that state into a reset,
-			// which tests destination failure instead of keep-alive teardown.
+			// Request EOF is only a half-close: keep the response direction
+			// alive, so the proxy must carry the application's full-close marker
+			// instead of succeeding because this fixture closed the destination.
 			_, _ = io.Copy(io.Discard, conn)
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			deadline := time.NewTimer(10 * time.Second)
+			defer deadline.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					// Further response bytes prove the application reader is gone;
+					// a legitimate half-close would still accept them.
+					if err := writeFull(conn, []byte("keepalive")); err != nil {
+						return
+					}
+				case <-deadline.C:
+					return
+				}
+			}
 		}()
 	}
 }
