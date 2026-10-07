@@ -1609,11 +1609,12 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 			return stats, fmt.Errorf("cumulative acknowledgement: %w", err)
 		case failure := <-f.laneErr:
 			err := failure.err
-			// Both FIN directions have already been observed. The application
-			// bytes are complete, and a tombstone can replay a lost final ACK;
-			// waiting the full lane-replacement grace here would leak an active
-			// server flow after a normal peer close.
-			if f.finSent.Load() && f.remoteFinSeen.Load() {
+			// With no surviving lane, both logical FINs let a tombstone absorb
+			// the final-ACK close race without waiting for replacement. But
+			// finSent is published before the FIN is actually written: a queued
+			// secondary-lane failure must not close a healthy writer and discard
+			// the peer's only opportunity to receive that pending FIN.
+			if f.finSent.Load() && f.remoteFinSeen.Load() && len(f.healthyLanes()) == 0 {
 				f.closeAll()
 				stats.Ended = time.Now()
 				stats.BytesSent = f.bytesUp.Load()
