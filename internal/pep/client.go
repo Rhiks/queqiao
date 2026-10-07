@@ -178,7 +178,7 @@ type ClientConfig struct {
 	MaxConnectionReceiveWindow uint64
 	MaxIncomingStreams         int64
 	// MemoryLimits is required by resource-constrained clients. Nil retains
-	// the throughput-oriented defaults used by servers and desktop clients.
+	// the throughput-oriented desktop client defaults.
 	MemoryLimits *MemoryLimits
 	Metrics      *metrics.Registry
 	// FallbackDelay is when AUTO starts connecting its warm-standby TCP

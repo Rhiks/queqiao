@@ -1021,10 +1021,34 @@ func (s *Server) watchFlowCompletion(ctx context.Context, sessionID [16]byte, se
 
 func (s *Server) retainCompletedSession(sessionID [16]byte, serverSession *serverFlow) {
 	serverSession.tombstone.Do(func() {
+		// A tombstone must not retain the live flow: even closed lanes still
+		// reference frame buffers and shared QUIC/coded transports. Snapshot
+		// only the immutable metadata used by the authenticated JOIN replay.
+		live := serverSession.flow
+		final := &multipathFlow{
+			sessionID: sessionID, flowID: live.flowID,
+			sendAckFlag: live.sendAckFlag, recvAckFlag: live.recvAckFlag,
+			reserveControlLane: live.reserveControlLane,
+		}
+		final.remoteFinSequence.Store(live.remoteFinSequence.Load())
+		final.finSequence.Store(live.finSequence.Load())
+		final.finSent.Store(live.finSent.Load())
+		final.remoteFinSeen.Store(live.remoteFinSeen.Load())
+		final.localAbortSent.Store(live.localAbortSent.Load())
+		final.finished.Store(true)
+		tombstone := &serverFlow{flow: final, principal: serverSession.principal}
+		tombstone.completed.Store(true)
 		serverSession.completed.Store(true)
+		s.sessionsMu.Lock()
+		if s.sessions[sessionID] != serverSession {
+			s.sessionsMu.Unlock()
+			return
+		}
+		s.sessions[sessionID] = tombstone
+		s.sessionsMu.Unlock()
 		time.AfterFunc(completedSessionLinger, func() {
 			s.cfg.Logger.Debug("session tombstone expired")
-			s.unregisterSession(sessionID, serverSession)
+			s.unregisterSession(sessionID, tombstone)
 		})
 	})
 }
