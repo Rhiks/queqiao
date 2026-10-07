@@ -476,6 +476,9 @@ func (f *multipathFlow) watchChunkCompletion(ctx context.Context, sched *stripe.
 			}
 			kept = append(kept, pending)
 		}
+		// The old backing array survives with the flow. Clear its unused tail
+		// so already-acknowledged chunks no longer keep payloads reachable.
+		clear(f.outstandingChunks[len(kept):])
 		f.outstandingChunks = kept
 		f.chunkMu.Unlock()
 		for _, done := range completed {

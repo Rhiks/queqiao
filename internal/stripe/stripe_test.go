@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/bojieli/queqiao/internal/memlimit"
@@ -1206,5 +1207,24 @@ func TestAChunkProvedMissingIsReissuedWithoutWaiting(t *testing.T) {
 	reliable.Wrote(1, first)
 	if n := reliable.ReissueUnacknowledgedBelow(first.End() + 1<<20); n != 0 {
 		t.Fatalf("re-offered %d chunks from a reliable lane, want none", n)
+	}
+}
+
+func TestCompletedChunkIsNotRetainedByPendingBackingArray(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	scheduler := New(iotest.DataErrReader(bytes.NewReader([]byte("one chunk"))), Config{ChunkSize: 32, LaneWindow: 1})
+	defer scheduler.Close()
+	chunk, err := scheduler.Next(ctx, 1, 0)
+	if err != nil || chunk == nil {
+		t.Fatalf("Next: %v, %v", chunk, err)
+	}
+	scheduler.Complete(1, chunk)
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+	for _, pending := range scheduler.pending[:cap(scheduler.pending)] {
+		if pending != nil && pending.Offset == chunk.Offset {
+			t.Fatal("completed chunk remains reachable through pending backing array")
+		}
 	}
 }

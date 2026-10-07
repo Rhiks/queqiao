@@ -530,6 +530,7 @@ type runtimeOptions struct {
 	logMaxBackups                                               int
 	telemetryLogInterval                                        time.Duration
 	metricsListen                                               string
+	sendMemoryBytes, receiveMemoryBytes                         int64
 }
 
 func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
@@ -585,6 +586,9 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.IntVar(&opts.udpFailureThreshold, "udp-failure-threshold", 3, "UDP failures before cooldown")
 		fs.DurationVar(&opts.udpCooldown, "udp-cooldown", 30*time.Second, "UDP cooldown after repeated failure")
 	} else {
+		memory := pep.DefaultServerMemoryLimits()
+		fs.Int64Var(&opts.sendMemoryBytes, "send-memory-budget", memory.SendBudgetBytes, "shared retained send payload budget in bytes")
+		fs.Int64Var(&opts.receiveMemoryBytes, "receive-memory-budget", memory.ReceiveBudgetBytes, "shared retained receive payload budget in bytes")
 		fs.StringVar(&opts.tcpCongestion, "tcp-congestion", "system", "server TCP congestion controller")
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this gateway serves: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.BoolVar(&opts.allowPrivate, "allow-private-destinations", false, "allow private and link-local destinations")
@@ -671,6 +675,9 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	}
 	if client && (opts.fallbackDelay < 0 || opts.fallbackGrace <= 0 || opts.udpFailureThreshold < 1 || opts.udpCooldown <= 0) {
 		return errors.New("invalid fallback settings")
+	}
+	if !client && (opts.sendMemoryBytes < 64<<20 || opts.receiveMemoryBytes < 128<<20) {
+		return errors.New("server memory budgets must cover the per-flow windows (send >= 64 MiB, receive >= 128 MiB)")
 	}
 	if client {
 		if err := netbind.Validate(opts.localAddress); err != nil {
@@ -798,11 +805,13 @@ func runServer(args []string) (returnErr error) {
 	if err != nil {
 		return err
 	}
+	logger.Info("server payload memory budgets", "send_bytes", opts.sendMemoryBytes, "receive_bytes", opts.receiveMemoryBytes)
 	logger.Info("path profile selected", "profile", serverProfile.Name,
 		"level", string(serverProfile.Level), "evidence", serverProfile.Evidence)
 	server, err := pep.NewServer(pep.ServerConfig{
 		ListenAddr: opts.listen, Credentials: provider.ServerCredentials(), Enrollment: service,
 		ChunkSize:        opts.chunkSize,
+		MemoryLimits:     &pep.MemoryLimits{SendBudgetBytes: opts.sendMemoryBytes, ReceiveBudgetBytes: opts.receiveMemoryBytes},
 		HandshakeTimeout: opts.handshakeTimeout, FlowIdleTimeout: opts.flowIdleTimeout,
 		FlowMaxLifetime: opts.flowMaxLifetime, MaxSessions: opts.maxSessions,
 		DestinationPolicy: pep.DestinationPolicy{AllowPrivate: opts.allowPrivate, DialTimeout: opts.dialTimeout},
@@ -818,7 +827,7 @@ func runServer(args []string) (returnErr error) {
 	if err != nil {
 		return err
 	}
-	stopMetrics, err := serveMetrics(opts.metricsListen, server.Metrics(), logger)
+	stopMetrics, err := serveMetrics(opts.metricsListen, server, logger)
 	if err != nil {
 		return err
 	}

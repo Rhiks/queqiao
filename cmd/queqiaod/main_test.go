@@ -226,3 +226,22 @@ func TestRuntimeConfigurationLogsRoleSpecificControls(t *testing.T) {
 		})
 	}
 }
+
+func TestServerMemoryBudgetRuntimeBounds(t *testing.T) {
+	opts := parseRuntimeForTest(t, false)
+	if opts.sendMemoryBytes != 128<<20 || opts.receiveMemoryBytes != 128<<20 {
+		t.Fatalf("memory defaults = %d/%d", opts.sendMemoryBytes, opts.receiveMemoryBytes)
+	}
+	for _, arg := range []string{"--send-memory-budget=0", "--receive-memory-budget=-1", "--send-memory-budget=1024"} {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		var invalid runtimeOptions
+		bindRuntimeFlags(fs, &invalid, false)
+		if err := fs.Parse([]string{arg}); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateRuntime(invalid, false); err == nil {
+			t.Fatalf("invalid budget accepted: %s", arg)
+		}
+	}
+}

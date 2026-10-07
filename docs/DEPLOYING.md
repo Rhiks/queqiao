@@ -182,6 +182,27 @@ endpoint. The server runtime log is independent of `/metrics`: it contains the
 same performance counters as timestamped JSON records and rotates internally
 at 32 MiB with five backups. See [`LOGGING.md`](LOGGING.md).
 
+### Retained payload memory
+
+The server shares a 128 MiB send budget and a 128 MiB receive budget across all
+TCP/QUIC flows, instead of multiplying retained payload capacity by the session
+count. Send exhaustion stops source reads until acknowledgements return bytes.
+Receive exhaustion terminates only the flow that cannot reserve its payload;
+ACK and other control processing do not wait for payload admission. Existing
+per-flow windows, UDP support, and transport receive windows are unchanged.
+
+`--send-memory-budget` and `--receive-memory-budget` accept bytes and allow larger
+budgets on high-capacity gateways. They must cover the default per-flow windows:
+at least 64 MiB send and 128 MiB receive. Library users can also set
+`ServerConfig.MemoryLimits` with matching per-flow limits.
+
+The existing `/metrics` endpoint includes
+`queqiao_payload_memory_{capacity,used,peak}_bytes` and
+`queqiao_payload_memory_waiters`, labelled by `direction="send"` or `"receive"`.
+These account retained payload allocations, not whole-process RSS. QUIC/coded
+buffers, stacks, runtime overhead, and garbage awaiting collection are separate.
+`GOMEMLIMIT` remains a soft Go runtime target, not an RSS ceiling.
+
 ### Tune provider socket queues
 
 Linux's default socket limits are often too small for a QUIC gateway. A burst

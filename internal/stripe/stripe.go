@@ -35,6 +35,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -105,7 +106,7 @@ type Config struct {
 	// full ChunkSize before allocating a source buffer and holds it until the
 	// logical chunk is acknowledged. This turns aggregate read-ahead into a
 	// hard endpoint limit instead of MaxOutstandingBytes multiplied by flows.
-	// Nil preserves the unbounded server/default profile.
+	// Nil disables shared accounting for callers that manage admission elsewhere.
 	Memory *memlimit.Budget
 	// RetransmitAfter is asked how long a chunk may be outstanding before it is
 	// presumed lost and offered again. Re-issuing duplicates bytes the receiver
@@ -473,7 +474,7 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 			//
 			continue
 		}
-		s.pending = append(s.pending[:i], s.pending[i+1:]...)
+		s.pending = slices.Delete(s.pending, i, i+1)
 		out, exists := s.live[chunk.Offset]
 		if !exists {
 			out = &outstanding{chunk: chunk}
@@ -943,7 +944,7 @@ func (s *Scheduler) removePendingLocked(offset uint64) *Chunk {
 		if chunk.Offset != offset {
 			continue
 		}
-		s.pending = append(s.pending[:i], s.pending[i+1:]...)
+		s.pending = slices.Delete(s.pending, i, i+1)
 		return chunk
 	}
 	return nil

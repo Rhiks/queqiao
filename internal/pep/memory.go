@@ -7,8 +7,8 @@ import (
 )
 
 // MemoryLimits turns the transport's multiplicative per-flow buffering into
-// fixed endpoint budgets. A nil *MemoryLimits keeps the throughput-oriented
-// server defaults. Mobile clients provide an explicit profile.
+// fixed endpoint budgets. Servers use DefaultServerMemoryLimits when nil;
+// clients retain their existing defaults unless they provide a profile.
 type MemoryLimits struct {
 	// SendBudgetBytes and ReceiveBudgetBytes are shared by all flows. Send
 	// reservations block source reads; receive reservations fail only the flow
@@ -26,6 +26,13 @@ type MemoryLimits struct {
 	FrameReadBufferBytes   int
 	MaxUDPPacketBytes      int
 	MaxBulkConnections     int
+}
+
+// DefaultServerMemoryLimits bounds retained application payload across all
+// sessions without reducing the existing per-flow windows. Transport buffers
+// and runtime overhead are separate, so this is not a process RSS limit.
+func DefaultServerMemoryLimits() MemoryLimits {
+	return MemoryLimits{SendBudgetBytes: 128 << 20, ReceiveBudgetBytes: 128 << 20}
 }
 
 type flowMemoryLimits struct {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/bojieli/queqiao/internal/classifier"
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/limiter"
+	"github.com/bojieli/queqiao/internal/memlimit"
 	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/portmux"
 	"github.com/bojieli/queqiao/internal/profile"
@@ -32,11 +34,14 @@ const completedSessionLinger = 90 * time.Second
 type ServerConfig struct {
 	// Profile names the deployment this gateway serves; see internal/profile.
 	// The zero value is the supported access-link profile.
-	Profile           profile.Profile
-	ListenAddr        string
-	Credentials       identity.ServerCredentials
-	Enrollment        *identity.EnrollmentService
-	ChunkSize         int
+	Profile     profile.Profile
+	ListenAddr  string
+	Credentials identity.ServerCredentials
+	Enrollment  *identity.EnrollmentService
+	ChunkSize   int
+	// MemoryLimits shares retained-payload admission across every session.
+	// Nil selects the bounded server defaults; per-flow windows are unchanged.
+	MemoryLimits      *MemoryLimits
 	HandshakeTimeout  time.Duration
 	FlowIdleTimeout   time.Duration
 	FlowMaxLifetime   time.Duration
@@ -102,6 +107,9 @@ type Server struct {
 	refusals        recordLimiter
 	accountRefusals recordLimiter
 	enrollLog       recordLimiter
+	memoryLimits    flowMemoryLimits
+	sendMemory      *memlimit.Budget
+	receiveMemory   *memlimit.Budget
 	budget          *limiter.Budget
 	metrics         *metrics.Registry
 	// udpRelays holds the relay sockets of UDP associations whose lane died,
@@ -337,22 +345,58 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	budget := limiter.New(limiter.Config{TotalBytesPerSec: cfg.AggregateBytesPerSec, ReserveBytesPerSec: cfg.InteractiveReserveBytesPerSec})
 	cfg.ChunkSize = chunkSizeForBudget(cfg.ChunkSize, budget)
+	if cfg.MemoryLimits == nil {
+		defaults := DefaultServerMemoryLimits()
+		cfg.MemoryLimits = &defaults
+	}
+	memoryLimits, sendMemory, receiveMemory, err := resolveMemoryLimits(cfg.MemoryLimits, cfg.ChunkSize)
+	if err != nil {
+		return nil, fmt.Errorf("server memory limits: %w", err)
+	}
 	server := &Server{
-		cfg:          cfg,
-		semaphore:    make(chan struct{}, cfg.MaxSessions),
-		connections:  make(chan struct{}, cfg.MaxSessions),
-		enrollments:  make(chan struct{}, min(cfg.MaxSessions, 64)),
-		sessions:     make(map[[16]byte]*serverFlow),
-		accountUsage: make(map[string]*accountUsage),
-		budget:       budget,
-		metrics:      cfg.Metrics,
-		udpRelays:    newUDPRelayStore(),
+		cfg:           cfg,
+		memoryLimits:  memoryLimits,
+		sendMemory:    sendMemory,
+		receiveMemory: receiveMemory,
+		semaphore:     make(chan struct{}, cfg.MaxSessions),
+		connections:   make(chan struct{}, cfg.MaxSessions),
+		enrollments:   make(chan struct{}, min(cfg.MaxSessions, 64)),
+		sessions:      make(map[[16]byte]*serverFlow),
+		accountUsage:  make(map[string]*accountUsage),
+		budget:        budget,
+		metrics:       cfg.Metrics,
+		udpRelays:     newUDPRelayStore(),
 	}
 	return server, nil
 }
 
 // Metrics exposes aggregate counters for an optional operator endpoint.
 func (s *Server) Metrics() *metrics.Registry { return s.metrics }
+
+func (s *Server) MemoryStats() MemoryStats {
+	return MemoryStats{Send: s.sendMemory.Snapshot(), Receive: s.receiveMemory.Snapshot()}
+}
+
+// ServeHTTP includes live byte-admission accounting in the existing metrics
+// endpoint. It does not expose flow identities, destinations, or payloads.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		s.metrics.ServeHTTP(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	stats := s.MemoryStats()
+	for _, entry := range []struct {
+		direction string
+		stats     memlimit.Snapshot
+	}{{"send", stats.Send}, {"receive", stats.Receive}} {
+		fmt.Fprintf(w, "queqiao_payload_memory_capacity_bytes{direction=%q} %d\n", entry.direction, entry.stats.Capacity)
+		fmt.Fprintf(w, "queqiao_payload_memory_used_bytes{direction=%q} %d\n", entry.direction, entry.stats.Used)
+		fmt.Fprintf(w, "queqiao_payload_memory_peak_bytes{direction=%q} %d\n", entry.direction, entry.stats.Peak)
+		fmt.Fprintf(w, "queqiao_payload_memory_waiters{direction=%q} %d\n", entry.direction, entry.stats.Waiters)
+	}
+	s.metrics.ServeHTTP(w, r)
+}
 
 func (s *Server) Serve(ctx context.Context) error {
 	serveCtx, cancel := context.WithCancel(ctx)
@@ -829,8 +873,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	}
 	s.cfg.Logger.Debug("remote flow opened", "transport", transportKindForConn(conn), "account", principal.AccountID, "device", principal.DeviceID, "open_duration", destinationDialStarted.Sub(sessionStarted), "destination_dial_duration", time.Since(destinationDialStarted), "total_duration", time.Since(sessionStarted))
 	defer destinationConn.Close()
-	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
-	flow.classifier = classifier.New(s.classifierConfig())
+	flow := newMultipathFlowWithMemory(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger, s.memoryLimits, s.sendMemory, s.receiveMemory, s.classifierConfig())
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout
