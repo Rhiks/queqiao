@@ -2083,6 +2083,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 	isolationAttempts := 0
 	var stallBackoff time.Duration
 	var nextStallRescue time.Time
+	var stallProgressNS int64
 	for {
 		select {
 		case <-flow.doneChan():
@@ -2101,6 +2102,21 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				continue
 			}
 			now := time.Now()
+			progressNS := flow.lastAckProgressNS.Load()
+			// A notification can wait while another operation runs. Recheck
+			// delivery before touching the shared pool: a recovered request or
+			// recent ACK makes the queued suspicion stale.
+			if !flow.pendingOutbound() || (progressNS > 0 && now.Sub(time.Unix(0, progressNS)) < flow.stallThreshold()) {
+				continue
+			}
+			// JOIN success proves reachability, not delivery. Only new data ACK
+			// progress resets the retry clock; otherwise successful but useless
+			// JOINs used to rotate healthy generations every second forever.
+			if progressNS != stallProgressNS {
+				stallProgressNS = progressNS
+				stallBackoff = 0
+				nextStallRescue = time.Time{}
+			}
 			if now.Before(nextStallRescue) {
 				continue
 			}
@@ -2132,21 +2148,16 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					c.cfg.Logger.Warn("stall rescue unavailable", "flow_id", flowID, "error", err)
 				}
-				if stallBackoff == 0 {
-					stallBackoff = time.Second
-				} else if stallBackoff < 15*time.Second {
-					stallBackoff *= 2
-					if stallBackoff > 15*time.Second {
-						stallBackoff = 15 * time.Second
-					}
-				}
-				nextStallRescue = time.Now().Add(stallBackoff)
-			} else {
-				// A fresh lane must prove itself before the next round of
-				// dials; the watchdog will re-signal if the stall is real.
-				stallBackoff = 0
-				nextStallRescue = time.Now().Add(time.Second)
 			}
+			if stallBackoff == 0 {
+				stallBackoff = time.Second
+			} else if stallBackoff < 15*time.Second {
+				stallBackoff *= 2
+				if stallBackoff > 15*time.Second {
+					stallBackoff = 15 * time.Second
+				}
+			}
+			nextStallRescue = time.Now().Add(stallBackoff)
 		case <-ticker.C:
 			// The remote completion watcher can close its lanes just before
 			// this scheduler tick. Both FIN directions are already known at
