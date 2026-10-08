@@ -273,6 +273,10 @@ func (p *Path) sendContext(ctx context.Context, frame []byte, copyFrame bool) er
 	}
 }
 
+// Done closes when this path stops accepting work, including carrier failure.
+// Owners use it to prevent a late flow from resurrecting a retired transport.
+func (p *Path) Done() <-chan struct{} { return p.done }
+
 // Receive returns the next frame to arrive, repaired if it had to be.
 func (p *Path) Receive() ([]byte, error) {
 	select {

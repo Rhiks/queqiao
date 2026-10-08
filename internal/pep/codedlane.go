@@ -44,6 +44,7 @@ type bulkDemux struct {
 	heldFrames  int
 	heldBytes   int
 	mu          sync.Mutex
+	closed      bool
 	// flows is keyed by flow identity.
 	flows map[uint64]*subscription
 	// held keeps frames that arrived before their flow did, which on a
@@ -83,6 +84,8 @@ func (d *bulkDemux) run() {
 		payload, err := d.path.Receive()
 		if err != nil {
 			d.mu.Lock()
+			d.closed = true
+			d.held = nil
 			for id, sub := range d.flows {
 				close(sub.frames)
 				delete(d.flows, id)
@@ -183,6 +186,9 @@ const (
 func (d *bulkDemux) subscribe(flowID uint64) <-chan protocol.Frame {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		return nil
+	}
 	sub, ok := d.flows[flowID]
 	if !ok {
 		queueFrames := d.queueFrames
@@ -241,6 +247,11 @@ func connBulkDemux(path *coded.Path, queueFrames int) *bulkDemux {
 	}
 	bulkDemuxMu.Lock()
 	defer bulkDemuxMu.Unlock()
+	select {
+	case <-path.Done():
+		return nil
+	default:
+	}
 	if existing, ok := bulkDemuxs.Load(path); ok {
 		return existing.(*bulkDemux)
 	}
@@ -254,6 +265,9 @@ func connBulkDemux(path *coded.Path, queueFrames int) *bulkDemux {
 func connBulkPath(conn *quic.Conn, queueFrames int) *coded.Path {
 	bulkPathMu.Lock()
 	defer bulkPathMu.Unlock()
+	if conn.Context().Err() != nil {
+		return nil
+	}
 	if existing, ok := bulkPaths.Load(conn); ok {
 		return existing.(*coded.Path)
 	}
@@ -264,13 +278,15 @@ func connBulkPath(conn *quic.Conn, queueFrames int) *coded.Path {
 	bulkPaths.Store(conn, created)
 	go func() {
 		<-conn.Context().Done()
+		// Mark the path closed before removing its registry entry. Readers
+		// finishing after deletion can neither recreate it nor subscribe to it.
+		_ = created.Close()
 		bulkPathMu.Lock()
 		bulkPaths.Delete(conn)
 		bulkPathMu.Unlock()
 		bulkDemuxMu.Lock()
 		bulkDemuxs.Delete(created)
 		bulkDemuxMu.Unlock()
-		_ = created.Close()
 	}()
 	return created
 }

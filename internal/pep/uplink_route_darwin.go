@@ -56,6 +56,33 @@ func defaultRouteGateway(m *route.RouteMessage, source string) string {
 	return ""
 }
 
+// Add/change notifications can refresh a healthy interface or the same route.
+// The next identity check already detects a genuinely new address/gateway.
+// Only a witnessed loss must invalidate a same-identity replacement path.
+func uplinkInterrupted(message route.Message, source string, bound bool) bool {
+	switch m := message.(type) {
+	case *route.InterfaceMessage:
+		return m.Flags&(syscall.IFF_UP|syscall.IFF_RUNNING) != syscall.IFF_UP|syscall.IFF_RUNNING
+	case *route.InterfaceAddrMessage:
+		if m.Type != syscall.RTM_DELADDR || !uplinkAddressChanged(m, source) {
+			return false
+		}
+		ip, err := netip.ParseAddr(source)
+		if err != nil {
+			return true // The physical source has already disappeared.
+		}
+		switch a := m.Addrs[syscall.RTAX_IFA].(type) {
+		case *route.Inet4Addr:
+			return ip.Unmap() == netip.AddrFrom4(a.IP)
+		case *route.Inet6Addr:
+			return ip.WithZone("") == netip.AddrFrom16(a.IP)
+		}
+	case *route.RouteMessage:
+		return m.Type == syscall.RTM_DELETE && defaultRouteGateway(m, source) != "" && (!bound || m.Flags&syscall.RTF_IFSCOPE != 0)
+	}
+	return false
+}
+
 func uplinkGateway(index int, source string) string {
 	rib, err := route.FetchRIB(syscall.AF_UNSPEC, route.RIBTypeRoute, 0)
 	if err != nil {
@@ -98,7 +125,6 @@ func (c *Client) uplinkEvents(ctx context.Context) <-chan struct{} {
 		defer stop()
 		buffer := make([]byte, 64*1024)
 		previous := c.uplinkInterface()
-		flags := make(map[int]int)
 		for {
 			n, err := file.Read(buffer)
 			if err != nil {
@@ -117,15 +143,11 @@ func (c *Client) uplinkEvents(ctx context.Context) <-chan struct{} {
 				relevant := false
 				switch m := message.(type) {
 				case *route.InterfaceMessage:
-					if matches(m.Index) {
-						old, known := flags[m.Index]
-						relevant = !known || old != m.Flags
-						flags[m.Index] = m.Flags
-					}
+					relevant = matches(m.Index) && uplinkInterrupted(m, source, c.cfg.LocalAddress != "")
 				case *route.InterfaceAddrMessage:
-					relevant = matches(m.Index) && uplinkAddressChanged(m, source)
+					relevant = matches(m.Index) && uplinkInterrupted(m, source, c.cfg.LocalAddress != "")
 				case *route.RouteMessage:
-					relevant = matches(m.Index) && (m.Type == syscall.RTM_ADD || m.Type == syscall.RTM_DELETE || m.Type == syscall.RTM_CHANGE) && defaultRouteGateway(m, source) != "" && (c.cfg.LocalAddress == "" || m.Flags&syscall.RTF_IFSCOPE != 0)
+					relevant = matches(m.Index) && uplinkInterrupted(m, source, c.cfg.LocalAddress != "")
 				}
 				if relevant {
 					notifyActivity(events)

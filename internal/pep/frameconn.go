@@ -263,8 +263,10 @@ func (c *frameConn) bulkFrames(flowID uint64) <-chan protocol.Frame {
 }
 
 func (c *frameConn) releaseBulk(flowID uint64) {
-	if demux := connBulkDemux(c.bulk, c.bulkQueueFrames); demux != nil {
-		demux.release(flowID)
+	// Releasing a subscriber must never create a new connection owner. The
+	// registry may already have been removed by connection shutdown.
+	if demux, exists := bulkDemuxs.Load(c.bulk); exists {
+		demux.(*bulkDemux).release(flowID)
 	}
 }
 

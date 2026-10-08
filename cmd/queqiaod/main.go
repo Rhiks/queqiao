@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	httppprof "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1164,6 +1165,12 @@ func serveMetrics(addr string, handler http.Handler, logger *slog.Logger) (func(
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", handler)
+	// Heap allocation sites are needed to distinguish retained application
+	// payload from transport/runtime memory. Keep this diagnostic local even
+	// when the operator exposes the ordinary aggregate metrics remotely.
+	if address, ok := listener.Addr().(*net.TCPAddr); ok && address.IP.IsLoopback() {
+		mux.Handle("/debug/pprof/heap", httppprof.Handler("heap"))
+	}
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {

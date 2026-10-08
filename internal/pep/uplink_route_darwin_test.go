@@ -49,3 +49,40 @@ func TestUplinkAddressIgnoresOtherFamily(t *testing.T) {
 		t.Fatal("IPv4 address churn reset an IPv6 pool")
 	}
 }
+
+func TestHealthyUplinkNotificationsDoNotInterruptConnections(t *testing.T) {
+	link := &route.InterfaceMessage{Flags: syscall.IFF_UP | syscall.IFF_RUNNING}
+	if uplinkInterrupted(link, "192.168.1.2", true) {
+		t.Fatal("initial healthy interface report resets the pool")
+	}
+	link.Flags |= syscall.IFF_PROMISC
+	if uplinkInterrupted(link, "192.168.1.2", true) {
+		t.Fatal("unrelated interface flag resets the pool")
+	}
+	link.Flags &^= syscall.IFF_RUNNING
+	if !uplinkInterrupted(link, "192.168.1.2", true) {
+		t.Fatal("missed a physical link interruption")
+	}
+	m := &route.RouteMessage{Flags: syscall.RTF_IFSCOPE, Addrs: make([]route.Addr, syscall.RTAX_MAX)}
+	m.Addrs[syscall.RTAX_DST] = &route.Inet4Addr{}
+	m.Addrs[syscall.RTAX_GATEWAY] = &route.Inet4Addr{IP: [4]byte{192, 168, 1, 1}}
+	for _, kind := range []int{syscall.RTM_ADD, syscall.RTM_CHANGE} {
+		m.Type = kind
+		if uplinkInterrupted(m, "192.168.1.2", true) {
+			t.Fatal("refreshing the same default route resets the pool")
+		}
+	}
+	m.Type = syscall.RTM_DELETE
+	if !uplinkInterrupted(m, "192.168.1.2", true) {
+		t.Fatal("missed loss of the bound default route")
+	}
+	address := &route.InterfaceAddrMessage{Type: syscall.RTM_DELADDR, Addrs: make([]route.Addr, syscall.RTAX_MAX)}
+	address.Addrs[syscall.RTAX_IFA] = &route.Inet4Addr{IP: [4]byte{192, 168, 1, 3}}
+	if uplinkInterrupted(address, "192.168.1.2", true) {
+		t.Fatal("removing another address resets the bound pool")
+	}
+	address.Addrs[syscall.RTAX_IFA] = &route.Inet4Addr{IP: [4]byte{192, 168, 1, 2}}
+	if !uplinkInterrupted(address, "192.168.1.2", true) {
+		t.Fatal("missed loss of the socket's source address")
+	}
+}
