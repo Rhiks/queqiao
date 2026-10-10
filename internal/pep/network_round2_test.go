@@ -100,7 +100,6 @@ func TestRound2HandshakeCancellation(t *testing.T) {
 
 func TestRound2OpenDeadlineWithoutApplicationPayload(t *testing.T) {
 	f := newGraceTestFlow(t)
-	f.openAckPending = true
 	f.requireOpenConfirmation()
 	f.openDeadline = time.Now().Add(30 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

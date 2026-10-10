@@ -84,6 +84,9 @@ type ServerConfig struct {
 	// lets package integration tests reproduce loss of a specific logical
 	// frame without depending on encrypted QUIC packet layout.
 	testLaneWriteHook func(protocol.Frame) error
+	// A per-server hook keeps slow-destination integration tests independent
+	// of the process-wide DNS resolver and unrelated background transports.
+	testDestinationDial func(context.Context, string) (net.Conn, error)
 }
 
 type Server struct {
@@ -865,7 +868,11 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		return
 	}
 	destinationDialStarted := time.Now()
-	destinationConn, err := s.cfg.DestinationPolicy.DialContext(ctx, destination)
+	dialDestination := s.cfg.DestinationPolicy.DialContext
+	if s.cfg.testDestinationDial != nil {
+		dialDestination = s.cfg.testDestinationDial
+	}
+	destinationConn, err := dialDestination(ctx, destination)
 	if err != nil {
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetDestination, "destination unavailable")})
 		s.cfg.Logger.Debug("destination dial failed", "error", err)

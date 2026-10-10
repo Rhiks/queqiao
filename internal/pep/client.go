@@ -864,7 +864,6 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	flowSession.ackRanges.Store(true)
 	flowSession.idleTimeout = c.cfg.FlowIdleTimeout
 	flowSession.maxLifetime = c.cfg.FlowMaxLifetime
-	flowSession.openAckPending = flow.openPending
 	flowSession.openDeadline = flow.openDeadline
 	if flow.openPending {
 		flowSession.requireOpenConfirmation()
@@ -2039,6 +2038,11 @@ func bulkLaneBudget(reserveControl bool) (bulk, controlReserve int) {
 }
 
 func (c *Client) manageLanes(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, initialKind TransportKind) {
+	// Both QUIC recovery/isolation and TCP bundle expansion use JOIN. The
+	// optimistic SOCKS reply is not proof that the gateway holds this session.
+	if !flow.waitForOpenConfirmation(ctx, nil) {
+		return
+	}
 	if initialKind == TransportTCP {
 		c.manageTCPBundle(ctx, flow, sessionID, flowID)
 		return

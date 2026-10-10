@@ -388,16 +388,12 @@ type multipathFlow struct {
 	remoteAbortCh     chan struct{}
 	localAbortSent    atomic.Bool
 	laneFailures      atomic.Uint64
-	// openAckPending is set only when the caller waited for nothing. The
-	// application may begin sending immediately, but the eventual OPEN_OK is
-	// still required on the authenticated stream and is consumed by the flow
-	// reader before ordinary data/control frames are accepted.
-	openAckPending bool
-	openDeadline   time.Time
+	openDeadline      time.Time
 	// openConfirmationRequired is true between an optimistic OPEN and OPEN_OK.
 	// A coded lane uses it to place one reliable safety copy behind OPEN while
 	// still sending the latency-sensitive coded copy immediately.
 	openConfirmationRequired atomic.Bool
+	openConfirmed            chan struct{}
 	// ackRanges is mandatory in protocol v1. It is useful to striped flows and
 	// harmless for a single lane.
 	ackRanges atomic.Bool
@@ -496,11 +492,26 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 // optimistic client path needs it; server flows and clients that explicitly
 // waited for OPEN_OK use the zero-value, already-confirmed state.
 func (f *multipathFlow) requireOpenConfirmation() {
+	f.openConfirmed = make(chan struct{})
 	f.openConfirmationRequired.Store(true)
 }
 
-func (f *multipathFlow) confirmOpen() {
-	f.openConfirmationRequired.Store(false)
+// Recovery and additional JOINs require a session the gateway has accepted.
+// During optimistic OPEN the application may send, but destination resolution
+// or connection establishment can still be in progress. Its existing OPEN
+// deadline owns this phase; a DATA stall must not turn it into an invalid JOIN.
+func (f *multipathFlow) waitForOpenConfirmation(ctx context.Context, stop <-chan struct{}) bool {
+	if !f.openConfirmationRequired.Load() {
+		return true
+	}
+	select {
+	case <-f.openConfirmed:
+		return true
+	case <-f.done:
+	case <-ctx.Done():
+	case <-stop:
+	}
+	return false
 }
 
 func (f *multipathFlow) addLane(lane *mpLane) error {
@@ -1897,6 +1908,9 @@ func scanStall(pending bool, progressNS int64, now time.Time, threshold time.Dur
 // longer than three RTTs. Receive-only outages remain the transport's job to
 // detect; application silence alone must not churn otherwise healthy lanes.
 func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
+	if !f.waitForOpenConfirmation(f.ctx, stop) {
+		return
+	}
 	interval := f.stallScan
 	if interval <= 0 {
 		interval = stallScanInterval
@@ -2918,11 +2932,9 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 					return nil
 				}
 			case protocol.TypeOpenOK:
-				if !f.openAckPending || frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID || len(frame.Payload) != 0 {
-					return errors.New("unexpected flow open acknowledgement")
+				if err := f.acceptOpenConfirmation(frame); err != nil {
+					return err
 				}
-				f.openAckPending = false
-				f.confirmOpen()
 			case protocol.TypeReset:
 				if len(frame.Payload) > 1 {
 					return fmt.Errorf("peer reset flow: %s", string(frame.Payload[1:]))

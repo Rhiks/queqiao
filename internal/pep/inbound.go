@@ -106,5 +106,6 @@ func (f *multipathFlow) acceptOpenConfirmation(frame protocol.Frame) error {
 	if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID || len(frame.Payload) != 0 || !f.openConfirmationRequired.CompareAndSwap(true, false) {
 		return errors.New("unexpected flow open acknowledgement")
 	}
+	close(f.openConfirmed)
 	return nil
 }
