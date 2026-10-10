@@ -64,7 +64,9 @@ type PathModel struct {
 	knowledge pathKnowledge
 	// aggregate is a windowed maximum of the summed delivered rate, which is
 	// the endpoint pair's bottleneck as measured from this side.
-	aggregate []bandwidthSample
+	aggregate bandwidthMaximum
+	// Only observations with busy senders can establish a capacity ceiling.
+	capacity bandwidthMaximum
 }
 
 type pathKnowledge struct {
@@ -155,9 +157,8 @@ type State struct {
 }
 
 type bandwidthSample struct {
-	rate          float64
-	at            time.Time
-	capacityKnown bool
+	rate float64
+	at   time.Time
 }
 
 const (
@@ -205,9 +206,11 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	if m == nil {
 		return State{}
 	}
-	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Timestamp observations in lock order so the window is chronological
+	// even when several QUIC lanes report concurrently.
+	now := time.Now()
 
 	entry, ok := m.members[member]
 	if !ok {
@@ -269,25 +272,12 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		state.RoundTrip = m.knowledge.roundTrip
 	}
 
-	if sum > 0 {
-		m.aggregate = append(m.aggregate, bandwidthSample{rate: sum, at: now, capacityKnown: busy > 0})
+	bottleneck := m.aggregate.observe(now, sum)
+	capacityRate := 0.0
+	if busy > 0 {
+		capacityRate = sum
 	}
-	bottleneck := 0.0
-	capacity := 0.0
-	kept := m.aggregate[:0]
-	for _, sample := range m.aggregate {
-		if now.Sub(sample.at) > bottleneckWindow {
-			continue
-		}
-		kept = append(kept, sample)
-		if sample.rate > bottleneck {
-			bottleneck = sample.rate
-		}
-		if sample.capacityKnown && sample.rate > capacity {
-			capacity = sample.rate
-		}
-	}
-	m.aggregate = kept
+	capacity := m.capacity.observe(now, capacityRate)
 
 	if live > 0 && bottleneck > 0 {
 		state.Seed = bottleneck / float64(live)
@@ -317,11 +307,11 @@ func (m *PathModel) Current() State {
 	if m == nil {
 		return State{}
 	}
-	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
 	var state State
-	var observed, bottleneck, capacity float64
+	var observed float64
 	var erasureWeighted, burstWeighted float64
 	live := 0
 	busy := 0
@@ -364,16 +354,8 @@ func (m *PathModel) Current() State {
 	} else if state.RoundTrip == 0 {
 		state.RoundTrip = m.knowledge.roundTrip
 	}
-	for _, sample := range m.aggregate {
-		if now.Sub(sample.at) <= bottleneckWindow {
-			if sample.rate > bottleneck {
-				bottleneck = sample.rate
-			}
-			if sample.capacityKnown && sample.rate > capacity {
-				capacity = sample.rate
-			}
-		}
-	}
+	bottleneck := m.aggregate.maximum(now)
+	capacity := m.capacity.maximum(now)
 	if bottleneck > 0 {
 		// The joining lane counts too, or the first thing it does is take a
 		// share sized for a path with one fewer lane on it.
