@@ -328,7 +328,7 @@ general-purpose proxy application is embedded.
 
 ## Build the shared core
 
-Both platforms require Go 1.26.6. The scripts select that patched toolchain,
+Both platforms require Go 1.26.9. The scripts select that patched toolchain,
 install the exact pinned gomobile
 tools into a temporary directory, verify both module graphs, run the core race
 suite, regenerate license notices, remove Go debug tables, audit the linked
@@ -386,7 +386,7 @@ changing anything about the manifest:
 
 ## Build iOS for a physical device
 
-Prerequisites are Xcode 26 or later, Go 1.26.6, and a paid Apple Developer
+Prerequisites are Xcode 26 or later, Go 1.26.9, and a paid Apple Developer
 Program membership with the Network Extension capability available to the
 selected team:
 
