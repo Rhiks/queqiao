@@ -234,6 +234,8 @@ func (s *flowSource) Read(p []byte) (int, error) {
 			// sendFinal. A full application close may need to abort while
 			// unacknowledged source chunks still keep the scheduler alive.
 			s.flow.noteLocalClose(s.flow.bytesUp.Load())
+		} else {
+			err = &flowEndpointError{err}
 		}
 	}
 	return n, err

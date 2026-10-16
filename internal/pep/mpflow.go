@@ -18,6 +18,7 @@ import (
 	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/multipath"
 	"github.com/bojieli/queqiao/internal/protocol"
+	"github.com/bojieli/queqiao/internal/session"
 	"github.com/bojieli/queqiao/internal/stripe"
 )
 
@@ -92,6 +93,12 @@ var (
 	errFlowLifetime          = errors.New("flow lifetime exceeded")
 	errLocalApplicationClose = errors.New("local application closed")
 )
+
+// Keep endpoint I/O failures distinct from lane failures and peer RESETs:
+// replacing a lane cannot repair a vanished application or destination.
+type flowEndpointError struct{ error }
+
+func (e *flowEndpointError) Unwrap() error { return e.error }
 
 type mpLane struct {
 	id          uint64
@@ -1578,6 +1585,15 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 					}
 				}
 				if err != nil {
+					var endpointErr *flowEndpointError
+					if errors.As(err, &endpointErr) {
+						message := "flow endpoint I/O failed"
+						var timeout net.Error
+						if errors.As(err, &timeout) && timeout.Timeout() {
+							message = "flow endpoint I/O timeout"
+						}
+						f.notifyPeerFailure(ctx, session.ResetDestination, message)
+					}
 					// Once the bounded remote-FIN drain above is exhausted, stop the
 					// sibling worker before tearing down the physical lanes. Otherwise
 					// a blocked application read can outlive the logical flow.
@@ -1596,6 +1612,9 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 			}
 			if f.metrics != nil {
 				f.metrics.FlowTimeout()
+			}
+			if errors.Is(err, errFlowIdleTimeout) || errors.Is(err, errFlowLifetime) {
+				f.notifyPeerFailure(ctx, session.ResetFlowLimit, err.Error())
 			}
 			cancelRun()
 			f.closeAll()
@@ -1682,6 +1701,27 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 	stats.BytesRead = f.bytesDown.Load()
 	stats.LaneBytes = f.laneStats()
 	return stats, nil
+}
+
+// Send a terminal reason before closing the healthy lane. A bare EOF makes
+// the peer attempt recovery against a session that is about to be removed.
+// This is best effort on existing lanes only, sharing the final-control-write
+// budget; it must never open a replacement or delay shutdown indefinitely.
+func (f *multipathFlow) notifyPeerFailure(ctx context.Context, code session.ResetCode, message string) {
+	writeCtx, cancel := context.WithTimeout(ctx, finalAckWriteGrace)
+	defer cancel()
+	frame := protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeReset,
+		SessionID: f.sessionID, FlowID: f.flowID, Class: protocol.Class(f.class.Load()),
+	}, Payload: session.ResetPayload(code, message)}
+	for _, lane := range f.healthyLanes() {
+		if writeCtx.Err() != nil {
+			return
+		}
+		if err := lane.fc.WriteContext(writeCtx, frame); err == nil {
+			return
+		}
+	}
 }
 
 // watchLimits turns silent or unbounded flows into explicit, observable
@@ -2827,7 +2867,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 		}
 		if err := writeFull(f.inner, out); err != nil {
 			if !expectedHalfCloseError(err) && !expectedDestinationCloseError(err) {
-				return err
+				return &flowEndpointError{err}
 			}
 			// A failed response write is direct proof that this was a full
 			// close, not merely a send-side half-close. Escalate immediately;
