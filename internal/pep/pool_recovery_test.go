@@ -78,6 +78,70 @@ func TestResumeReplacesPoolsBeforeConcurrentBorrowersReuseThem(t *testing.T) {
 	}
 }
 
+// A failed path probe can leave an older generation carrying healthy sibling
+// flows. A later system resume must expire those transports too, even though
+// new borrowers have already moved to a different generation.
+func TestResumeExpiresDrainingControlGeneration(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	c := rig.client
+	t.Cleanup(c.closeQUICPool)
+	var suspended atomic.Int64
+	c.readSuspendTime = func() (time.Duration, error) {
+		return time.Duration(suspended.Load()), nil
+	}
+	c.resumeState = suspendWatchState{known: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ccfg := congestionConfig{kind: defaultCongestion()}
+	first, err := c.dialPooledQUICLane(ctx, ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	old := first.(*controlPoolStreamConn).generation
+	c.drainControlQUICGeneration(old)
+	second, err := c.dialPooledQUICLane(ctx, ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	current := second.(*controlPoolStreamConn).generation
+	if current == old || old.conn.Context().Err() != nil {
+		t.Fatal("rotation must retain the old sibling on its own transport")
+	}
+	if err := probeControlGeneration(ctx, old, time.Second); err != nil {
+		t.Fatalf("retained sibling cannot progress before resume: %v", err)
+	}
+	suspended.Store(int64(laneDeadPathDetection + time.Second))
+	if !c.checkSystemResume() {
+		t.Fatal("resume was not detected")
+	}
+	if old.conn.Context().Err() == nil || current.conn.Context().Err() == nil {
+		t.Fatal("resume left a pre-sleep draining control connection open")
+	}
+	third, err := c.dialPooledQUICLane(ctx, ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Close()
+	fresh := third.(*controlPoolStreamConn).generation
+	first.Close()
+	second.Close()
+	if err := probeControlGeneration(ctx, fresh, time.Second); err != nil {
+		t.Fatalf("old borrowers damaged the post-resume transport: %v", err)
+	}
+	c.quicMu.Lock()
+	owned := len(c.quicGenerations)
+	c.quicMu.Unlock()
+	if owned != 1 {
+		t.Fatalf("closed generations retained in client ownership: %d", owned)
+	}
+	c.closeQUICPool()
+	if fresh.conn.Context().Err() == nil {
+		t.Fatal("client shutdown left the replacement transport open")
+	}
+}
+
 // A pooled connection is a failure domain, but it must not be a recovery
 // stampede. Retiring one generation with several live logical flows should
 // create exactly one new UDP socket, rejoin every flow as a stream on it, and

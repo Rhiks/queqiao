@@ -221,8 +221,12 @@ type Client struct {
 	// dead shared connection causes one handshake rather than one handshake per
 	// affected flow. The dial has a client lifetime of its own and is not
 	// cancelled merely because the first flow waiting for it goes away.
-	quicMu          sync.Mutex
-	quicGeneration  *controlQUICGeneration
+	quicMu         sync.Mutex
+	quicGeneration *controlQUICGeneration
+	// Draining generations still carry borrowed streams and remain owned by
+	// the client until their last borrower releases them. Path resets and
+	// shutdown must close them along with the current generation.
+	quicGenerations map[*controlQUICGeneration]struct{}
 	quicDial        *controlQUICDial
 	quicEpoch       uint64
 	resumeMu        sync.Mutex
@@ -387,6 +391,7 @@ type bulkConn struct {
 // precise: a late failure from an old stream can retire its own generation but
 // can never close the healthy generation which replaced it.
 type controlQUICGeneration struct {
+	owner      *Client
 	borrowMu   sync.Mutex
 	borrowers  int
 	draining   bool
@@ -405,6 +410,11 @@ func (g *controlQUICGeneration) close(reason string) {
 		return
 	}
 	g.closeOnce.Do(func() {
+		if g.owner != nil {
+			g.owner.quicMu.Lock()
+			delete(g.owner.quicGenerations, g)
+			g.owner.quicMu.Unlock()
+		}
 		if g.conn != nil {
 			_ = g.conn.CloseWithError(0, reason)
 		}
@@ -791,13 +801,21 @@ func (c *Client) closeControlQUICPool(reason string) {
 	c.quicMu.Lock()
 	c.quicEpoch++
 	generation, dial := c.quicGeneration, c.quicDial
+	generations := make([]*controlQUICGeneration, 0, len(c.quicGenerations)+1)
+	for g := range c.quicGenerations {
+		generations = append(generations, g)
+	}
+	if _, tracked := c.quicGenerations[generation]; generation != nil && !tracked {
+		generations = append(generations, generation)
+	}
 	c.quicGeneration, c.quicDial = nil, nil
+	c.quicGenerations = nil
 	c.quicMu.Unlock()
 	if dial != nil {
 		dial.cancel()
 	}
-	if generation != nil {
-		generation.close(reason)
+	for _, g := range generations {
+		g.close(reason)
 	}
 }
 
@@ -1583,7 +1601,8 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 	var generation *controlQUICGeneration
 	if err == nil {
 		generation = &controlQUICGeneration{
-			id: attempt.epoch, conn: conn, packet: packet, verified: time.Now(),
+			owner: c,
+			id:    attempt.epoch, conn: conn, packet: packet, verified: time.Now(),
 			controller: configureQUICController(conn, ccfg),
 		}
 	}
@@ -1593,6 +1612,10 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 	if current {
 		c.quicDial = nil
 		if err == nil {
+			if c.quicGenerations == nil {
+				c.quicGenerations = make(map[*controlQUICGeneration]struct{})
+			}
+			c.quicGenerations[generation] = struct{}{}
 			c.quicGeneration = generation
 			attempt.generation = generation
 		} else {
