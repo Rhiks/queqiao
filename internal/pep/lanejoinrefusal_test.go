@@ -242,6 +242,7 @@ func TestCompletedJoinReplayHonorsCancellation(t *testing.T) {
 			owner := identity.Principal{ProviderID: "p", AccountID: "a", DeviceID: "d"}
 			flow := newIsolationTestFlow(t, false)
 			flow.finSent.Store(true)
+			flow.remoteFinSeen.Store(true)
 			sf := newServerFlow(flow, owner, TransportTCP, 1)
 			sf.completed.Store(true)
 			server := &Server{cfg: ServerConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, sessions: map[[16]byte]*serverFlow{flow.sessionID: sf}, metrics: metrics.New()}

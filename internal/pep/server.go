@@ -1147,31 +1147,7 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		if err := fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}); err != nil {
 			return
 		}
-		// The completed server flow has already acknowledged the peer's FIN;
-		// repeat that ACK on this authenticated replacement lane.
-		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
-			Version: protocol.Version, Type: protocol.TypeAck, Flags: protocol.FlagAckFinal | serverSession.flow.recvAckFlag,
-			SessionID: sessionID, FlowID: open.Header.FlowID, Sequence: serverSession.flow.remoteFinSequence.Load(),
-			Class: protocol.ClassBulk,
-		}})
-		// The final ACK above acknowledges the peer's FIN.  If the server's
-		// own FIN was lost while the last physical lane was closing, replay it
-		// as well; otherwise the client can receive the complete application
-		// body yet remain stuck waiting for the remote half-close until its
-		// replacement timeout.  Keep the ACK first for compatibility with
-		// clients that begin consuming the tombstone immediately after
-		// OpenOK, then let the normal flow reader process this FIN.
-		if serverSession.flow.finSent.Load() {
-			flags := uint16(protocol.FlagFin)
-			if serverSession.flow.localAbortSent.Load() {
-				flags |= protocol.FlagCloseAbort
-			}
-			_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
-				Version: protocol.Version, Type: protocol.TypeClose, Flags: flags,
-				SessionID: sessionID, FlowID: open.Header.FlowID, Sequence: serverSession.flow.finSequence.Load(),
-				Class: protocol.ClassBulk,
-			}})
-		}
+		serverSession.flow.replayCloseState(writeCtx, fc)
 		return
 	}
 	replacement := &mpLane{
@@ -1226,25 +1202,7 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 	// had already received as application bytes. FIN/ACK frames are
 	// idempotent at the reassembler and cumulative-ACK state, so replaying them
 	// is safe even when the original frame was merely delayed.
-	if serverSession.flow.remoteFinSeen.Load() {
-		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
-			Version: protocol.Version, Type: protocol.TypeAck,
-			Flags:     protocol.FlagAckFinal | serverSession.flow.recvAckFlag,
-			SessionID: sessionID, FlowID: open.Header.FlowID,
-			Sequence: serverSession.flow.remoteFinSequence.Load(), Class: protocol.ClassBulk,
-		}})
-	}
-	if serverSession.flow.finSent.Load() {
-		flags := uint16(protocol.FlagFin)
-		if serverSession.flow.localAbortSent.Load() {
-			flags |= protocol.FlagCloseAbort
-		}
-		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
-			Version: protocol.Version, Type: protocol.TypeClose, Flags: flags,
-			SessionID: sessionID, FlowID: open.Header.FlowID,
-			Sequence: serverSession.flow.finSequence.Load(), Class: protocol.ClassBulk,
-		}})
-	}
+	serverSession.flow.replayCloseState(writeCtx, fc)
 	cancelWrite()
 	// A retired lane must release its admission slot while the logical flow
 	// continues on its replacement. Waiting only for the flow leaks slots.
@@ -1252,6 +1210,34 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 	case <-fc.done:
 	case <-serverSession.flow.doneChan():
 	case <-ctx.Done():
+	}
+}
+
+// Live and retained sessions must replay the same observed close state. A
+// destination abort can finish a flow without receiving the peer's FIN or
+// sending a normal FIN. In that case an unconditional final ACK invents a
+// sequence (usually zero), while checking only finSent loses the actual abort.
+func (f *multipathFlow) replayCloseState(ctx context.Context, fc *frameConn) {
+	if f.remoteFinSeen.Load() {
+		// Keep a valid final ACK before our FIN for existing JOIN readers.
+		_ = fc.WriteContext(ctx, protocol.Frame{Header: protocol.Header{
+			Version: protocol.Version, Type: protocol.TypeAck,
+			Flags:     protocol.FlagAckFinal | f.recvAckFlag,
+			SessionID: f.sessionID, FlowID: f.flowID,
+			Sequence: f.remoteFinSequence.Load(), Class: protocol.ClassBulk,
+		}})
+	}
+	abort := f.localAbortSent.Load()
+	if f.finSent.Load() || abort {
+		flags := uint16(protocol.FlagFin)
+		if abort {
+			flags |= protocol.FlagCloseAbort
+		}
+		_ = fc.WriteContext(ctx, protocol.Frame{Header: protocol.Header{
+			Version: protocol.Version, Type: protocol.TypeClose, Flags: flags,
+			SessionID: f.sessionID, FlowID: f.flowID,
+			Sequence: f.finSequence.Load(), Class: protocol.ClassBulk,
+		}})
 	}
 }
 
