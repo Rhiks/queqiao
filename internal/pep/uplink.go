@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
+	"github.com/apernet/quic-go"
 	"github.com/bojieli/queqiao/internal/netbind"
 	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/protocol"
@@ -330,16 +332,20 @@ func (c *Client) probePath(lane *authenticatedLane) {
 	// reading that echo makes the connection carry enough server-to-client
 	// traffic for the gateway's own controller to measure that direction.
 	//
-	// The echo is required rather than hoped for. Version 1 has no capability
-	// negotiation and no compatibility window: a peer that speaks the ALPN and
-	// completes mutual TLS has agreed to all of protocol 1, so a gateway that
+	// The echo is required rather than hoped for: a peer that speaks the ALPN
+	// and completes mutual TLS has agreed to the wire protocol, so a gateway that
 	// accepts the probe and does not reflect it is not an older build to be
 	// tolerated -- it is a peer whose behaviour this client cannot account for,
 	// on a connection it was about to hand real traffic to.
 	if closer, ok := lane.outer.(interface{ CloseWrite() error }); ok && sent > 0 {
 		if err := closer.CloseWrite(); err == nil {
 			if err := c.readPathProbeEchoes(lane, sent); err != nil {
-				c.rejectProbePeer(lane, err)
+				var violation probeEchoViolation
+				if errors.As(err, &violation) {
+					c.rejectProbePeer(lane, err)
+				} else {
+					c.cfg.Logger.Debug("path prewarm interrupted", "error", err)
+				}
 				return
 			}
 		}
@@ -348,13 +354,11 @@ func (c *Client) probePath(lane *authenticatedLane) {
 }
 
 // probeEchoViolation is a gateway that did not reflect the probe sequence
-// protocol 1 requires it to reflect.
+// the wire protocol requires it to reflect.
 //
-// It is kept distinct from a slow path because the two call for opposite
-// responses. The probe rides the reliable control stream, so a short echo is
-// never loss: either the budget expired, which is a measurement this client
-// simply does not get, or the peer disagrees about the protocol, which is a
-// connection it must not carry user traffic on.
+// It is kept distinct from a slow or interrupted path. A budget expiry or
+// transport failure leaves the measurement incomplete; a malformed response or
+// clean EOF before the promised echo is evidence against this connection.
 type probeEchoViolation struct{ reason string }
 
 func (e probeEchoViolation) Error() string { return e.reason }
@@ -372,9 +376,20 @@ func (c *Client) readPathProbeEchoes(lane *authenticatedLane, sent int) error {
 			// The probe is bounded in time as well as in packets. Running out
 			// of budget on a slow path leaves the measurement incomplete, which
 			// is the cost of bounding it, and says nothing about the peer.
-			var timeout net.Error
-			if errors.As(err, &timeout) && timeout.Timeout() {
-				return nil
+			var networkError net.Error
+			if errors.As(err, &networkError) {
+				if networkError.Timeout() {
+					return nil
+				}
+				return err
+			}
+			// Address loss, local pool retirement and stream cancellation say
+			// nothing about the peer's framing. In particular, a late reader
+			// must not turn our own connection close into another pool reset.
+			var streamCanceled *quic.StreamError
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) ||
+				errors.Is(err, io.ErrClosedPipe) || errors.As(err, &streamCanceled) {
+				return err
 			}
 			return probeEchoViolation{reason: fmt.Sprintf("gateway ended the probe echo after %d of %d frames: %v", sequence, sent, err)}
 		}
@@ -402,14 +417,19 @@ func (c *Client) readPathProbeEchoes(lane *authenticatedLane, sent int) error {
 // for the first user flow. Leaving one behind whose peer just disagreed about
 // the protocol would spend that flow on the disagreement instead, and the
 // pooled connection would outlive the evidence that it is unsound. Dropping the
-// pool costs one handshake and is recovered by the next dial.
+// offending carrier costs one handshake and is recovered by the next dial.
 func (c *Client) rejectProbePeer(lane *authenticatedLane, err error) {
-	c.cfg.Logger.Warn("gateway violated the protocol-1 path probe contract", "error", err)
+	c.cfg.Logger.Warn("gateway violated path probe contract", "protocol", protocol.Version, "error", err)
 	if c.metrics != nil {
 		c.metrics.PeerProtocolViolation()
 	}
+	// Reject only the carrier that supplied this response. The probe may
+	// finish after another borrower has already recovered onto a new pool;
+	// neither that generation nor unrelated bulk connections belong to it.
+	if pooled, ok := lane.fc.transport().(*controlPoolStreamConn); ok {
+		c.retireControlQUICGeneration(pooled.generation, "queqiao invalid path probe echo")
+	}
 	_ = lane.fc.Close()
-	c.closeQUICPool()
 }
 
 // awaitMeasurement waits for the answer the probe was asking for.
