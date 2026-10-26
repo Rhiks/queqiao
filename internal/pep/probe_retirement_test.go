@@ -41,7 +41,7 @@ func TestPrewarmTransportInterruptionIsNotPeerViolation(t *testing.T) {
 			lane := &authenticatedLane{outer: outer, fc: newFrameConn(outer), sessionID: [16]byte{1}}
 			defer lane.fc.Close()
 			client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, metrics: metrics.New()}
-			client.probePath(lane)
+			client.probePath(context.Background(), lane)
 			if got := client.metrics.Snapshot().PeerProtocolViolations; got != 0 {
 				t.Fatalf("transport interruption counted as %d peer protocol violations", got)
 			}

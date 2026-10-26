@@ -275,7 +275,7 @@ func (c *Client) prewarmPath(ctx context.Context) {
 	// The handshake alone is about ten packets, which is enough to notice that
 	// a path erases and not enough to say how much, so the prewarm sends a
 	// little more before letting go.
-	c.probePath(lane)
+	c.probePath(warm, lane)
 	// The connection stays in the pool; only this lane's framing is done with.
 	_ = lane.fc.Close()
 }
@@ -306,15 +306,18 @@ const (
 // sequence one-for-one, so each endpoint's controller measures the direction
 // it actually sends into and publishes that evidence before a user flow is
 // accepted.
-func (c *Client) probePath(lane *authenticatedLane) {
-	if lane == nil || lane.fc == nil {
+func (c *Client) probePath(ctx context.Context, lane *authenticatedLane) {
+	if ctx.Err() != nil || lane == nil || lane.fc == nil {
 		return
 	}
 	payload := make([]byte, probePayloadBytes)
-	deadline := time.Now().Add(pathProbeBudget)
-	_ = lane.outer.SetDeadline(deadline)
+	// The dial and the rest of the prewarm share one lifetime. Reuse the
+	// stream-scoped cancellation binding so abandoning a prewarm interrupts
+	// its blocked I/O without closing sibling streams on the pooled carrier.
+	deadline, finish := bindHandshake(ctx, lane.outer, pathProbeBudget)
+	defer finish()
 	sent := 0
-	for sent < pathProbePackets && time.Now().Before(deadline) {
+	for sent < pathProbePackets && ctx.Err() == nil && time.Now().Before(deadline) {
 		frame := protocol.Frame{
 			Header: protocol.Header{
 				Version: protocol.Version, Type: protocol.TypeProbe,
@@ -326,6 +329,9 @@ func (c *Client) probePath(lane *authenticatedLane) {
 			return
 		}
 		sent++
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	// A half-close is the probe's delimiter. The authenticated gateway echoes
 	// exactly the bounded padding it received, then closes its send direction;
@@ -340,6 +346,9 @@ func (c *Client) probePath(lane *authenticatedLane) {
 	if closer, ok := lane.outer.(interface{ CloseWrite() error }); ok && sent > 0 {
 		if err := closer.CloseWrite(); err == nil {
 			if err := c.readPathProbeEchoes(lane, sent); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				var violation probeEchoViolation
 				if errors.As(err, &violation) {
 					c.rejectProbePeer(lane, err)
@@ -350,7 +359,7 @@ func (c *Client) probePath(lane *authenticatedLane) {
 			}
 		}
 	}
-	c.awaitMeasurement(lane, deadline)
+	c.awaitMeasurement(ctx, lane, deadline)
 }
 
 // probeEchoViolation is a gateway that did not reflect the probe sequence
@@ -439,17 +448,26 @@ func (c *Client) rejectProbePeer(lane *authenticatedLane, err error) {
 // them -- so a prewarm that sent and returned would leave exactly the
 // ignorance it was opened to remove, and the first flow would still be the one
 // discovering the path.
-func (c *Client) awaitMeasurement(lane *authenticatedLane, deadline time.Time) {
+func (c *Client) awaitMeasurement(ctx context.Context, lane *authenticatedLane, deadline time.Time) {
+	if ctx.Err() != nil || !time.Now().Before(deadline) {
+		return
+	}
 	keyed, ok := lane.outer.(interface{ pathIdentity() string })
 	if !ok {
 		return
 	}
 	model := pathmodel.Shared(keyed.pathIdentity())
-	for time.Now().Before(deadline) {
+	ticker := time.NewTicker(measurementPoll)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) && ctx.Err() == nil {
 		if model.Current().ObservedSamples >= pathProbePackets {
 			return
 		}
-		time.Sleep(measurementPoll)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
