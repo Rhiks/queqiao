@@ -1,7 +1,8 @@
 package congestion
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -578,7 +579,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 			e.outcomes = append(e.outcomes, packetOutcome{number: packet.PacketNumber})
 		}
 	}
-	sort.Slice(e.outcomes, func(i, j int) bool { return e.outcomes[i].number < e.outcomes[j].number })
+	slices.SortFunc(e.outcomes, func(a, b packetOutcome) int { return cmp.Compare(a.number, b.number) })
 	for _, outcome := range e.outcomes {
 		e.estimator.ObserveOutcome(outcome.arrived)
 	}

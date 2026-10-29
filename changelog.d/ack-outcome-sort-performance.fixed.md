@@ -1,0 +1,1 @@
+Remove reflection allocations from erasure congestion-event sorting while preserving packet ordering and channel estimates. Batched ACK/loss processing uses typed sorting over its existing scratch buffer.
