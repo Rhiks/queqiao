@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -14,6 +15,11 @@ type DestinationPolicy struct {
 	AllowPrivate bool
 	DialTimeout  time.Duration
 }
+
+var (
+	errDestinationNotPublic   = errors.New("destination address is not public")
+	errDestinationNoAddresses = errors.New("destination did not resolve")
+)
 
 var additionallyForbidden = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
@@ -61,11 +67,11 @@ func (p DestinationPolicy) DialContext(ctx context.Context, destination string) 
 	} else {
 		addresses, err = net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err != nil {
-			return nil, errors.New("destination resolution failed")
+			return nil, fmt.Errorf("destination resolution failed: %w", err)
 		}
 	}
 	if len(addresses) == 0 {
-		return nil, errors.New("destination did not resolve")
+		return nil, errDestinationNoAddresses
 	}
 
 	dialer := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
@@ -73,7 +79,7 @@ func (p DestinationPolicy) DialContext(ctx context.Context, destination string) 
 	var candidates []string
 	for _, candidate := range addresses {
 		if !p.AllowPrivate && !publicDestinationIP(candidate.IP) {
-			lastErr = errors.New("destination address is not public")
+			lastErr = errDestinationNotPublic
 			continue
 		}
 		candidates = append(candidates, net.JoinHostPort(candidate.IP.String(), strconv.Itoa(port)))
@@ -93,6 +99,7 @@ func dialDestinationCandidates(ctx context.Context, addresses []string, dial fun
 	if len(addresses) < 2 {
 		return dialDestinationSerial(ctx, addresses, dial)
 	}
+	addresses = interleaveDestinationFamilies(addresses)
 	// The addresses have already passed policy validation. Race only concrete
 	// addresses so a second DNS lookup cannot rebind a public name to a private
 	// destination. Two staggered workers bound sockets per OPEN; a healthy
@@ -154,6 +161,103 @@ func dialDestinationCandidates(ctx context.Context, addresses []string, dial fun
 			}
 		}
 	}
+}
+
+// Keep resolver preference within each family, but give the alternate family
+// the speculative slot. Splitting a grouped resolver list by odd/even index
+// otherwise puts both workers on the same blackholed network.
+func interleaveDestinationFamilies(addresses []string) []string {
+	if len(addresses) < 3 {
+		return addresses
+	}
+	family := func(address string) (bool, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return false, err
+		}
+		ip, err := netip.ParseAddr(host)
+		return ip.Unmap().Is4(), err
+	}
+	firstIPv4, err := family(addresses[0])
+	if err != nil {
+		return addresses
+	}
+	// The existing fast path already races different families, or has no
+	// alternate family. Avoid allocations and reordering in either case.
+	secondIPv4, err := family(addresses[1])
+	if err != nil || secondIPv4 != firstIPv4 {
+		return addresses
+	}
+	hasAlternate := false
+	for _, address := range addresses[2:] {
+		ipv4, err := family(address)
+		if err != nil {
+			return addresses
+		}
+		if ipv4 != firstIPv4 {
+			hasAlternate = true
+			break
+		}
+	}
+	if !hasAlternate {
+		return addresses
+	}
+	var groups [2][]string
+	for _, address := range addresses {
+		ipv4, err := family(address)
+		if err != nil {
+			return addresses
+		}
+		index := 0
+		if ipv4 != firstIPv4 {
+			index = 1
+		}
+		groups[index] = append(groups[index], address)
+	}
+	if len(groups[1]) == 0 {
+		return addresses
+	}
+	ordered := make([]string, 0, len(addresses))
+	for i := 0; i < max(len(groups[0]), len(groups[1])); i++ {
+		for _, group := range groups {
+			if i < len(group) {
+				ordered = append(ordered, group[i])
+			}
+		}
+	}
+	return ordered
+}
+
+// Only a bounded category crosses the wire or enters operational logs. The
+// underlying net errors can contain destination names and addresses.
+func destinationFailureReason(err error) string {
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		if dns.Timeout() {
+			return "dns_timeout"
+		}
+		if dns.IsNotFound {
+			return "dns_not_found"
+		}
+		return "dns_error"
+	}
+	switch {
+	case errors.Is(err, errDestinationNotPublic):
+		return "address_not_public"
+	case errors.Is(err, errDestinationNoAddresses):
+		return "no_addresses"
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection_refused"
+	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
+		return "network_unreachable"
+	}
+	var timeout net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() {
+		return "connect_timeout"
+	}
+	return "connect_error"
 }
 
 func dialDestinationSerial(ctx context.Context, addresses []string, dial func(context.Context, string) (net.Conn, error)) (net.Conn, error) {

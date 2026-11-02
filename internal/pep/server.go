@@ -874,8 +874,9 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	}
 	destinationConn, err := dialDestination(ctx, destination)
 	if err != nil {
-		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetDestination, "destination unavailable")})
-		s.cfg.Logger.Debug("destination dial failed", "error", err)
+		reason := destinationFailureReason(err)
+		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetDestination, "destination unavailable: "+reason)})
+		s.cfg.Logger.Warn("destination dial failed", "reason", reason, "duration", time.Since(destinationDialStarted))
 		return
 	}
 	s.cfg.Logger.Debug("remote flow opened", "transport", transportKindForConn(conn), "account", principal.AccountID, "device", principal.DeviceID, "open_duration", destinationDialStarted.Sub(sessionStarted), "destination_dial_duration", time.Since(destinationDialStarted), "total_duration", time.Since(sessionStarted))

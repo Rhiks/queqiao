@@ -3,9 +3,12 @@ package pep
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -125,5 +128,59 @@ func TestDestinationDialHonorsCancellationAndPrivatePolicy(t *testing.T) {
 	}
 	if conn, err := (DestinationPolicy{}).DialContext(context.Background(), "127.0.0.1:443"); err == nil || conn != nil {
 		t.Fatal("private TCP destination accepted")
+	}
+}
+
+// A resolver can group several addresses from a broken family before a
+// reachable alternate. Both workers must not wait on that same family.
+func TestDestinationDialRacesAddressFamilies(t *testing.T) {
+	for _, addresses := range [][]string{
+		{"[2001:db8::1]:443", "[2001:db8::2]:443", "192.0.2.1:443"},
+		{"192.0.2.1:443", "192.0.2.2:443", "[2001:db8::1]:443"},
+	} {
+		t.Run(addresses[0], func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			winner, peer := net.Pipe()
+			defer winner.Close()
+			defer peer.Close()
+			started := time.Now()
+			conn, err := dialDestinationCandidates(ctx, addresses, func(ctx context.Context, address string) (net.Conn, error) {
+				if address == addresses[2] {
+					return winner, nil
+				}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			})
+			if err != nil || conn != winner {
+				t.Fatalf("alternate family failed: %v", err)
+			}
+			if elapsed := time.Since(started); elapsed > 700*time.Millisecond {
+				t.Fatalf("healthy alternate family waited behind blackholed addresses for %v", elapsed)
+			}
+			t.Logf("alternate connected in %v", time.Since(started))
+		})
+	}
+}
+
+func TestDestinationFailureReasonDoesNotDiscloseTarget(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want string
+	}{
+		{&net.DNSError{Err: "private resolver text", Name: "private.example", IsTimeout: true}, "dns_timeout"},
+		{fmt.Errorf("resolve: %w", &net.DNSError{Err: "no such host", Name: "private.example", IsNotFound: true}), "dns_not_found"},
+		{&net.DNSError{Err: "resolver failure", Name: "private.example"}, "dns_error"},
+		{errDestinationNotPublic, "address_not_public"},
+		{errDestinationNoAddresses, "no_addresses"},
+		{context.Canceled, "cancelled"},
+		{&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}, "connection_refused"},
+		{syscall.ENETUNREACH, "network_unreachable"},
+		{fmt.Errorf("dial: %w", os.ErrDeadlineExceeded), "connect_timeout"},
+		{errors.New("failure for private.example"), "connect_error"},
+	} {
+		if got := destinationFailureReason(test.err); got != test.want {
+			t.Errorf("reason = %s, want %s", got, test.want)
+		}
 	}
 }
