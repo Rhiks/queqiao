@@ -2995,10 +2995,10 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 			return errors.New("flow closed")
 		case <-sendDoneC:
 			sendDoneC = nil
-			if f.localAbortSent.Load() {
-				return errLocalApplicationClose
-			}
-			if remoteFin {
+			// Sender EOF is not acknowledgement of our full-close marker.
+			// Keep receiving until the peer ACKs that abort or its existing
+			// bounded drain expires; closing here can discard the marker.
+			if remoteFin && !f.localAbortSent.Load() {
 				return nil
 			}
 		case <-abortTimerC:

@@ -974,3 +974,42 @@ func TestInboundDeliveryBlockedByAFullQueueStopsWithTheFlow(t *testing.T) {
 		t.Fatal("inbound reader remained blocked after flow teardown")
 	}
 }
+
+// EOF from the local sender can race with the failed response write that
+// proves full close. It does not acknowledge delivery of the abort marker.
+func TestLocalAbortWaitsForPeerACKAfterSenderStops(t *testing.T) {
+	inner, app := net.Pipe()
+	defer app.Close()
+	defer inner.Close()
+	outer := newAckCaptureConn(0, nil)
+	flow := newMultipathFlow(context.Background(), &writeFailConn{Conn: inner, err: halfCloseSamples[0].err},
+		[16]byte{2}, 8, 1024, protocol.FlagAckUp, protocol.FlagAckDown, nil, nil)
+	defer flow.closeAll()
+	flow.abortDrainGrace = 400 * time.Millisecond
+	flow.lanes[0] = &mpLane{id: 0, fc: newFrameConn(outer)}
+	result := make(chan error, 1)
+	go func() { result <- flow.receiveInner(context.Background()) }()
+	flow.events <- inboundEvent{frame: protocol.Frame{Header: protocol.Header{Version: protocol.Version,
+		Type: protocol.TypeData, SessionID: flow.sessionID, FlowID: flow.flowID}, Payload: []byte("response")}}
+	closeFrame := waitAckFrame(t, outer)
+	if closeFrame.Header.Flags != protocol.FlagFin|protocol.FlagCloseAbort {
+		t.Fatal("missing abort")
+	}
+	close(flow.sendDone)
+	select {
+	case err := <-result:
+		t.Fatalf("sender EOF bypassed abort acknowledgement drain: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	flow.events <- inboundEvent{frame: protocol.Frame{Header: protocol.Header{Version: protocol.Version,
+		Type: protocol.TypeAck, SessionID: flow.sessionID, FlowID: flow.flowID,
+		Flags: protocol.FlagAckUp | protocol.FlagAckFinal, Sequence: flow.finSequence.Load()}}}
+	select {
+	case err := <-result:
+		if !errors.Is(err, errLocalApplicationClose) {
+			t.Fatalf("abort ACK: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("peer abort ACK did not release flow")
+	}
+}
