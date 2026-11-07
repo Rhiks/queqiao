@@ -232,6 +232,10 @@ func (m *ClientPortMux) SetReadBuffer(bytes int) error {
 	return m.conn.SetReadBuffer(bytes)
 }
 
+func (m *ClientPortMux) SetWriteBuffer(bytes int) error {
+	return m.conn.SetWriteBuffer(bytes)
+}
+
 // — ServerPortMux —
 
 // serverPacket carries one UDP datagram received by any of the server's
@@ -454,5 +458,25 @@ func (m *ServerPortMux) SetWriteDeadline(t time.Time) error {
 }
 
 func (m *ServerPortMux) SetReadBuffer(bytes int) error {
-	return m.primary.SetReadBuffer(bytes)
+	if err := m.primary.SetReadBuffer(bytes); err != nil {
+		return err
+	}
+	for _, s := range m.secondaries {
+		if err := s.SetReadBuffer(bytes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *ServerPortMux) SetWriteBuffer(bytes int) error {
+	if err := m.primary.SetWriteBuffer(bytes); err != nil {
+		return err
+	}
+	for _, s := range m.secondaries {
+		if err := s.SetWriteBuffer(bytes); err != nil {
+			return err
+		}
+	}
+	return nil
 }

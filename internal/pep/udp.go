@@ -49,6 +49,18 @@ const (
 var errUDPAssociationCloseAck = errors.New("UDP association close acknowledged")
 var errUDPControlClosed = errors.New("SOCKS UDP control connection closed")
 
+type udpAssociationPeerResetError struct {
+	code    session.ResetCode
+	message string
+}
+
+func (e *udpAssociationPeerResetError) Error() string {
+	if e.message != "" {
+		return "peer reset UDP association: " + e.message
+	}
+	return "peer reset UDP association"
+}
+
 type udpCounters struct {
 	up   atomic.Uint64
 	down atomic.Uint64
@@ -163,6 +175,22 @@ func (c *Client) handleUDPAssociate(ctx context.Context, control net.Conn) {
 	failed := false
 	gracefulClose := false
 	var endErr error
+	finishPeerTermination := func(err error) bool {
+		if errors.Is(err, errUDPAssociationCloseAck) {
+			gracefulClose = true
+			endErr = nil
+			return true
+		}
+		var reset *udpAssociationPeerResetError
+		if !errors.As(err, &reset) {
+			return false
+		}
+		if reset.code == session.ResetFlowLimit {
+			c.metrics.FlowTimeout()
+		}
+		failed, endErr = true, err
+		return true
+	}
 
 laneLoop:
 	for {
@@ -181,11 +209,7 @@ laneLoop:
 		for {
 			select {
 			case endErr = <-resultCh:
-				if errors.Is(endErr, errUDPAssociationCloseAck) {
-					// A peer is not allowed to close an association silently, but a
-					// final ACK is a valid terminal event if the SOCKS control socket
-					// disappears at the same time.
-					gracefulClose = true
+				if finishPeerTermination(endErr) {
 					laneCancel()
 					_ = lane.fc.Close()
 					goto done
@@ -195,11 +219,43 @@ laneLoop:
 					_ = lane.fc.Close()
 					goto done
 				}
+				select {
+				case <-idleTimer.C:
+					c.metrics.FlowTimeout()
+					failed = true
+					endErr = errors.New("UDP association idle timeout")
+					laneCancel()
+					_ = lane.fc.Close()
+					goto done
+				case <-lifetimeTimer.C:
+					c.metrics.FlowTimeout()
+					failed = true
+					endErr = errors.New("UDP association lifetime exceeded")
+					laneCancel()
+					_ = lane.fc.Close()
+					goto done
+				default:
+				}
 				// Stop both workers before opening another authenticated
 				// association. This prevents the old uplink worker from consuming a
 				// packet from the preserved local UDP socket after the replacement
 				// becomes active.
-				stopUDPAssociationLane(laneCancel, lane, resultCh, 1)
+				if finishPeerTermination(stopUDPAssociationLane(laneCancel, lane, resultCh, 1)) {
+					goto done
+				}
+				select {
+				case <-idleTimer.C:
+					c.metrics.FlowTimeout()
+					failed = true
+					endErr = errors.New("UDP association idle timeout")
+					goto done
+				case <-lifetimeTimer.C:
+					c.metrics.FlowTimeout()
+					failed = true
+					endErr = errors.New("UDP association lifetime exceeded")
+					goto done
+				default:
+				}
 				c.metrics.LaneFailure()
 				replacement, reconnectErr := c.rescueUDPAssociation(assocCtx, controlClosed, resumeToken)
 				if errors.Is(reconnectErr, errUDPControlClosed) {
@@ -245,6 +301,7 @@ laneLoop:
 				c.metrics.FlowTimeout()
 				failed = true
 				endErr = errors.New("UDP association idle timeout")
+				_ = c.closeUDPAssociation(lane, flowID, resultCh)
 				laneCancel()
 				_ = lane.fc.Close()
 				goto done
@@ -252,6 +309,7 @@ laneLoop:
 				c.metrics.FlowTimeout()
 				failed = true
 				endErr = errors.New("UDP association lifetime exceeded")
+				_ = c.closeUDPAssociation(lane, flowID, resultCh)
 				laneCancel()
 				_ = lane.fc.Close()
 				goto done
@@ -332,22 +390,29 @@ func waitForUDPReconnect(ctx context.Context, controlClosed <-chan struct{}, del
 // stopUDPAssociationLane waits for both lane workers after cancellation. The
 // uplink uses a one-second read poll, so this bound prevents an old worker from
 // consuming a datagram after a replacement lane has been installed while also
-// keeping shutdown independent of a broken transport.
-func stopUDPAssociationLane(cancel context.CancelFunc, lane *authenticatedLane, results <-chan error, completed int) {
+// keeping shutdown independent of a broken transport. A terminal downlink
+// result must survive this drain when an uplink error won the first select.
+func stopUDPAssociationLane(cancel context.CancelFunc, lane *authenticatedLane, results <-chan error, completed int) error {
 	cancel()
 	if lane != nil && lane.fc != nil {
 		_ = lane.fc.Close()
 	}
 	deadline := time.NewTimer(udpReadPoll + 500*time.Millisecond)
 	defer deadline.Stop()
+	var terminalErr error
 	for completed < 2 {
 		select {
-		case <-results:
+		case err := <-results:
+			var reset *udpAssociationPeerResetError
+			if errors.Is(err, errUDPAssociationCloseAck) || errors.As(err, &reset) {
+				terminalErr = err
+			}
 			completed++
 		case <-deadline.C:
-			return
+			return terminalErr
 		}
 	}
+	return terminalErr
 }
 
 // closeUDPAssociation performs the bounded half-close handshake. Other
@@ -666,6 +731,15 @@ func runClientUDPDownlink(ctx context.Context, udpConn *net.UDPConn, fc *frameCo
 		if frame.Header.Type == protocol.TypeAck && frame.Header.Flags == protocol.FlagAckFinal && frame.Header.Sequence == 0 && len(frame.Payload) == 0 {
 			return errUDPAssociationCloseAck
 		}
+		if frame.Header.Type == protocol.TypeReset {
+			var code session.ResetCode
+			var message string
+			if len(frame.Payload) > 0 {
+				code = session.ResetCode(frame.Payload[0])
+				message = string(frame.Payload[1:])
+			}
+			return &udpAssociationPeerResetError{code: code, message: message}
+		}
 		if frame.Header.Type != protocol.TypePacket || frame.Header.Flags != 0 {
 			return errors.New("invalid UDP association frame")
 		}
@@ -888,6 +962,14 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		}
 		idleTimer.Reset(s.cfg.FlowIdleTimeout)
 	}
+	notifyPeerReset := func(code session.ResetCode, message string) {
+		writeCtx, writeCancel := context.WithTimeout(assocCtx, finalAckWriteGrace)
+		defer writeCancel()
+		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
+			Version: protocol.Version, Type: protocol.TypeReset,
+			SessionID: sessionID, FlowID: flowID, Class: protocol.ClassInteractive,
+		}, Payload: session.ResetPayload(code, message)})
+	}
 	for {
 		select {
 		case frame := <-frames:
@@ -980,22 +1062,26 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 			}
 			endErr = err
 			failed = true
+			notifyPeerReset(session.ResetDestination, "UDP relay socket failed")
 			s.cfg.Logger.Debug("UDP relay packet reader ended", "error", err)
 			goto done
 		case <-idleTimer.C:
 			s.metrics.FlowTimeout()
 			endErr = errors.New("UDP association idle timeout")
 			failed = true
+			notifyPeerReset(session.ResetFlowLimit, endErr.Error())
 			goto done
 		case <-lifetimeTimer.C:
 			s.metrics.FlowTimeout()
 			endErr = errors.New("UDP association lifetime exceeded")
 			failed = true
+			notifyPeerReset(session.ResetFlowLimit, endErr.Error())
 			goto done
 		case <-authorizationTicker.C:
 			if _, err := s.cfg.Credentials.Store.Authorize(principal, time.Now()); err != nil {
 				endErr = errors.New("UDP association authorization revoked")
 				failed = true
+				notifyPeerReset(session.ResetAuthentication, endErr.Error())
 				goto done
 			}
 		case <-assocCtx.Done():

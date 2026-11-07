@@ -668,6 +668,20 @@ func (c *transientRoutePacketConn) WriteTo(payload []byte, addr net.Addr) (int, 
 	return len(payload), nil
 }
 
+func (c *transientRoutePacketConn) SetReadBuffer(bytes int) error {
+	if conn, ok := c.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return conn.SetReadBuffer(bytes)
+	}
+	return nil
+}
+
+func (c *transientRoutePacketConn) SetWriteBuffer(bytes int) error {
+	if conn, ok := c.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return conn.SetWriteBuffer(bytes)
+	}
+	return nil
+}
+
 // transientRouteOOBPacketConn preserves quic-go's UDP fast path. Hiding
 // ReadMsgUDP / WriteMsgUDP behind a plain net.PacketConn would disable ECN,
 // batched I/O and GSO on Linux, turning a resilience fix into a throughput
@@ -699,6 +713,13 @@ func (c *transientRouteOOBPacketConn) SyscallConn() (syscall.RawConn, error) {
 
 func (c *transientRouteOOBPacketConn) SetReadBuffer(bytes int) error {
 	return c.oob.SetReadBuffer(bytes)
+}
+
+func (c *transientRouteOOBPacketConn) SetWriteBuffer(bytes int) error {
+	if conn, ok := c.oob.(interface{ SetWriteBuffer(int) error }); ok {
+		return conn.SetWriteBuffer(bytes)
+	}
+	return c.transientRoutePacketConn.SetWriteBuffer(bytes)
 }
 
 func (c *transientRouteOOBPacketConn) ReadMsgUDP(payload, oob []byte) (int, int, int, *net.UDPAddr, error) {

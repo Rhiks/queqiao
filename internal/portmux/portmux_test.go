@@ -467,3 +467,47 @@ func TestASinglePortPoolIsNotTreatedAsAFailure(t *testing.T) {
 		t.Fatalf("skipped %v with nothing to skip", mux.SkippedPorts())
 	}
 }
+
+func TestPortMuxReadAndWriteBuffers(t *testing.T) {
+	primary, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	free, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		_ = primary.Close()
+		t.Fatal(err)
+	}
+	hopPort := free.LocalAddr().(*net.UDPAddr).Port
+	_ = free.Close()
+
+	primaryAddr := primary.LocalAddr().(*net.UDPAddr)
+	ports := []int{primaryAddr.Port, hopPort}
+	srvMux, err := portmux.NewServerPortMux(primary, ports)
+	if err != nil {
+		_ = primary.Close()
+		t.Fatal(err)
+	}
+	defer func() { _ = srvMux.Close() }()
+
+	if err := srvMux.SetReadBuffer(256 * 1024); err != nil {
+		t.Fatalf("ServerPortMux.SetReadBuffer: %v", err)
+	}
+	if err := srvMux.SetWriteBuffer(256 * 1024); err != nil {
+		t.Fatalf("ServerPortMux.SetWriteBuffer: %v", err)
+	}
+
+	clientUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cliMux := portmux.NewClientPortMux(clientUDP, primaryAddr, ports)
+	defer func() { _ = cliMux.Close() }()
+
+	if err := cliMux.SetReadBuffer(256 * 1024); err != nil {
+		t.Fatalf("ClientPortMux.SetReadBuffer: %v", err)
+	}
+	if err := cliMux.SetWriteBuffer(256 * 1024); err != nil {
+		t.Fatalf("ClientPortMux.SetWriteBuffer: %v", err)
+	}
+}

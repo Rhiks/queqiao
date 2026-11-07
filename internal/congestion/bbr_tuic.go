@@ -646,23 +646,14 @@ func (b *TUICBBRSender) appLimited(priorInFlight quiccongestion.ByteCount) bool 
 	return !drainLimited || available > tuicMaxBurstPackets*b.maxDatagramSize
 }
 
-func obsoletePacketNumber(acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) (quiccongestion.PacketNumber, bool) {
-	var largest quiccongestion.PacketNumber = -1
-	if len(acked) > 0 {
-		for _, packet := range acked {
-			if packet.PacketNumber > largest {
-				largest = packet.PacketNumber
-			}
-		}
-		if largest < 0 {
-			return 0, false
-		}
-		if largest > 1 {
-			return largest - 2, true
-		}
-		return 0, true
+const tuicObsoletePacketWindow quiccongestion.PacketNumber = 256
+
+func obsoletePacketNumber(acked []quiccongestion.AckedPacketInfo, _ []quiccongestion.LostPacketInfo) (quiccongestion.PacketNumber, bool) {
+	if len(acked) == 0 {
+		return 0, false
 	}
-	for _, packet := range lost {
+	var largest quiccongestion.PacketNumber = -1
+	for _, packet := range acked {
 		if packet.PacketNumber > largest {
 			largest = packet.PacketNumber
 		}
@@ -670,10 +661,10 @@ func obsoletePacketNumber(acked []quiccongestion.AckedPacketInfo, lost []quiccon
 	if largest < 0 {
 		return 0, false
 	}
-	if largest == quiccongestion.PacketNumber(^uint64(0)>>1) {
-		return largest, true
+	if largest > tuicObsoletePacketWindow {
+		return largest - tuicObsoletePacketWindow, true
 	}
-	return largest + 1, true
+	return 0, true
 }
 
 func (b *TUICBBRSender) updateRecoveryState(lastAckedPacket quiccongestion.PacketNumber, hasLosses, roundStart bool) {

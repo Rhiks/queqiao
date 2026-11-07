@@ -204,6 +204,9 @@ func (e *tuicBandwidthEstimator) onLost(number quiccongestion.PacketNumber) tuic
 // only taken while the range is no longer than the map; past that the scan is
 // the cheaper of the two and is bounded by tuicMaxSendStates.
 func (e *tuicBandwidthEstimator) removeObsolete(leastUnacked quiccongestion.PacketNumber) {
+	if e.lowestKnown && leastUnacked <= e.lowestState {
+		return
+	}
 	if len(e.packetStates) == 0 {
 		e.lowestState, e.lowestKnown = leastUnacked, true
 		return
@@ -265,15 +268,15 @@ func (e *tuicBandwidthEstimator) onAckBatch(eventTime monotime.Time, acked []qui
 		if packet.BytesAcked <= 0 {
 			continue
 		}
-		state, ok := e.packetStates[packet.PacketNumber]
-		if !ok {
-			e.stateMisses = satAddUint64(e.stateMisses, 1)
-			continue
-		}
 		bytes := uint64(packet.BytesAcked)
 		e.totalAcked = satAddUint64(e.totalAcked, bytes)
 		if e.appLimited && (e.endAppLimitedAt < 0 || packet.PacketNumber > e.endAppLimitedAt) {
 			e.appLimited = false
+		}
+		state, ok := e.packetStates[packet.PacketNumber]
+		if !ok {
+			e.stateMisses = satAddUint64(e.stateMisses, 1)
+			continue
 		}
 		ackTime := eventTime
 		if !packet.ReceivedTime.IsZero() {
@@ -460,6 +463,7 @@ func (e *tuicBandwidthEstimator) pruneStates() {
 	}
 	if remove >= len(e.packetStates) {
 		clear(e.packetStates)
+		e.lowestState, e.lowestKnown = 0, false
 		return
 	}
 	numbers := make([]quiccongestion.PacketNumber, 0, len(e.packetStates))
@@ -470,6 +474,7 @@ func (e *tuicBandwidthEstimator) pruneStates() {
 	for _, pn := range numbers[:remove] {
 		delete(e.packetStates, pn)
 	}
+	e.lowestState, e.lowestKnown = numbers[remove], true
 }
 
 func (e *tuicBandwidthEstimator) bytesAckedThisWindow() uint64 {

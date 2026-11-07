@@ -435,3 +435,55 @@ func TestALPNFailureExplainsEndpointOrVersionMismatch(t *testing.T) {
 		t.Fatalf("non-ALPN error was replaced: %v", got)
 	}
 }
+
+// Buffer setters must reach the physical socket through either wrapper shape.
+type bufferRecordingPacketConn struct {
+	routeErrorPacketConn
+	readBuffer, writeBuffer int
+	bufferErr               error
+}
+
+func (c *bufferRecordingPacketConn) SetReadBuffer(n int) error { c.readBuffer = n; return c.bufferErr }
+func (c *bufferRecordingPacketConn) SetWriteBuffer(n int) error {
+	c.writeBuffer = n
+	return c.bufferErr
+}
+
+type bufferRecordingOOBConn struct {
+	*net.UDPConn
+	readBuffer, writeBuffer int
+	bufferErr               error
+}
+
+func (c *bufferRecordingOOBConn) SetReadBuffer(n int) error  { c.readBuffer = n; return c.bufferErr }
+func (c *bufferRecordingOOBConn) SetWriteBuffer(n int) error { c.writeBuffer = n; return c.bufferErr }
+
+func TestTransientRouteWrappersForwardBufferSizesAndErrors(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	injected := errors.New("buffer setter failed")
+	plain := &bufferRecordingPacketConn{bufferErr: injected}
+	oob := &bufferRecordingOOBConn{UDPConn: udp, bufferErr: injected}
+	for _, physical := range []net.PacketConn{plain, oob} {
+		wrapped := tolerateTransientRouteErrors(physical, nil)
+		setter, ok := wrapped.(interface {
+			SetReadBuffer(int) error
+			SetWriteBuffer(int) error
+		})
+		if !ok {
+			t.Fatalf("%T hides the buffer setters", wrapped)
+		}
+		if err := setter.SetReadBuffer(123456); err != injected {
+			t.Fatalf("read error = %v", err)
+		}
+		if err := setter.SetWriteBuffer(234567); err != injected {
+			t.Fatalf("write error = %v", err)
+		}
+	}
+	if plain.readBuffer != 123456 || plain.writeBuffer != 234567 || oob.readBuffer != 123456 || oob.writeBuffer != 234567 {
+		t.Fatalf("buffer sizes did not reach both physical sockets: plain=%+v oob=%+v", plain, oob)
+	}
+}

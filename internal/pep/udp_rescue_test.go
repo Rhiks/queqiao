@@ -354,3 +354,97 @@ func openTestUDPAssociation(t *testing.T, control net.Conn) *net.UDPAddr {
 	_ = control.SetDeadline(time.Time{})
 	return &net.UDPAddr{IP: net.IPv4(reply[4], reply[5], reply[6], reply[7]), Port: int(binary.BigEndian.Uint16(reply[8:10]))}
 }
+
+func TestUDPAssociationServerIdleTimeoutDoesNotTriggerClientRescue(t *testing.T) {
+	tcpListener, quicPacketConn := listenTCPAndUDPOnOnePort(t)
+	tlsCert, roots := testCertificate(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server, err := NewServer(ServerConfig{
+		ListenAddr: tcpListener.Addr().String(), Credentials: tlsCert,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: true, EnableQUIC: true,
+		FlowIdleTimeout: 60 * time.Millisecond, FlowMaxLifetime: time.Second,
+		Logger: logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientListener.Close()
+	client, err := NewClient(ClientConfig{
+		ListenAddr: clientListener.Addr().String(), RemoteAddr: tcpListener.Addr().String(),
+		Credentials: roots, Transport: TransportAuto, FallbackDelay: 2 * time.Second,
+		FlowIdleTimeout: 2 * time.Second, FlowMaxLifetime: 5 * time.Second,
+		Logger: logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceCtx, serviceCancel := context.WithCancel(context.Background())
+	defer serviceCancel()
+	errorsCh := make(chan error, 3)
+	go func() { errorsCh <- server.ServeListener(serviceCtx, tcpListener) }()
+	go func() { errorsCh <- server.ServePacketConn(serviceCtx, quicPacketConn) }()
+	go func() { errorsCh <- client.ServeListener(serviceCtx, clientListener) }()
+
+	control, err := net.DialTimeout("tcp", clientListener.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	_ = openTestUDPAssociation(t, control)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for client.Metrics().Snapshot().ActiveFlows > 0 && time.Now().Before(deadline) {
+		time.Sleep(15 * time.Millisecond)
+	}
+	gotClient := client.Metrics().Snapshot()
+	if gotClient.ActiveFlows != 0 {
+		t.Fatalf("client active flows = %d, want 0 after server idle timeout", gotClient.ActiveFlows)
+	}
+	if gotClient.UDPAssociationReconnects != 0 || gotClient.LaneFailures != 0 || gotClient.Fallbacks != 0 {
+		t.Fatalf("server UDP idle timeout triggered bogus client rescue/fallback: %+v", gotClient)
+	}
+	if gotClient.FlowTimeouts != 1 {
+		t.Fatalf("client flow timeouts = %d, want 1", gotClient.FlowTimeouts)
+	}
+	if retained := server.udpRelays.retained(); retained != 0 {
+		t.Fatalf("server retained %d UDP relays after idle timeout, want 0", retained)
+	}
+
+	serviceCancel()
+	for range 3 {
+		select {
+		case <-errorsCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("service shutdown timeout")
+		}
+	}
+}
+
+func TestUDPAssociationLaneStopPreservesQueuedPeerTermination(t *testing.T) {
+	reset := &udpAssociationPeerResetError{code: session.ResetFlowLimit, message: "idle timeout"}
+	for _, terminal := range []error{reset, errUDPAssociationCloseAck} {
+		t.Run(terminal.Error(), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			results := make(chan error, 1)
+			// The uplink's EOF was already consumed by the main loop; the
+			// downlink's authoritative terminal result is still queued.
+			results <- terminal
+			if got := stopUDPAssociationLane(cancel, nil, results, 1); got != terminal {
+				t.Fatalf("drain lost peer termination: got %v, want %v", got, terminal)
+			}
+			if ctx.Err() == nil {
+				t.Fatal("old lane workers were not canceled")
+			}
+		})
+	}
+	results := make(chan error, 1)
+	results <- io.EOF
+	if got := stopUDPAssociationLane(func() {}, nil, results, 1); got != nil {
+		t.Fatalf("ordinary transport EOF must remain rescuable: %v", got)
+	}
+}

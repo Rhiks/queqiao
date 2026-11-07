@@ -48,5 +48,10 @@ proxy-groups:
 
 rules:
   - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-SUFFIX,xn--fiqs8s,DIRECT
+  - GEOSITE,private,DIRECT
+  - GEOSITE,cn,DIRECT
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,geolocation-!cn,Proxy
   - GEOIP,CN,DIRECT
   - MATCH,Proxy
