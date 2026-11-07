@@ -397,7 +397,11 @@ func TestUDPAssociationServerIdleTimeoutDoesNotTriggerClientRescue(t *testing.T)
 	_ = openTestUDPAssociation(t, control)
 
 	deadline := time.Now().Add(2 * time.Second)
-	for client.Metrics().Snapshot().ActiveFlows > 0 && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) {
+		snapshot := client.Metrics().Snapshot()
+		if snapshot.FlowTimeouts == 1 && snapshot.ActiveFlows == 0 {
+			break
+		}
 		time.Sleep(15 * time.Millisecond)
 	}
 	gotClient := client.Metrics().Snapshot()
