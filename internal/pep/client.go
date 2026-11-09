@@ -391,18 +391,19 @@ type bulkConn struct {
 // precise: a late failure from an old stream can retire its own generation but
 // can never close the healthy generation which replaced it.
 type controlQUICGeneration struct {
-	owner      *Client
-	borrowMu   sync.Mutex
-	borrowers  int
-	draining   bool
-	probeMu    sync.Mutex
-	verified   time.Time
-	probe      *controlPathProbe
-	id         uint64
-	conn       *quic.Conn
-	packet     net.PacketConn
-	controller wancongestion.TelemetryProvider
-	closeOnce  sync.Once
+	owner         *Client
+	borrowMu      sync.Mutex
+	borrowers     int
+	draining      bool
+	probeMu       sync.Mutex
+	verified      time.Time
+	invalidatedAt time.Time
+	probe         *controlPathProbe
+	id            uint64
+	conn          *quic.Conn
+	packet        net.PacketConn
+	controller    wancongestion.TelemetryProvider
+	closeOnce     sync.Once
 }
 
 func (g *controlQUICGeneration) close(reason string) {
@@ -1417,6 +1418,7 @@ func (c *Client) openFlowMode(ctx context.Context, destination string, _ bool) (
 		_ = lane.fc.Close()
 		return nil, err
 	}
+	lane.fc.recordControlOpenProof()
 	return &openedFlow{
 		fc: lane.fc, outer: lane.outer, sessionID: lane.sessionID, flowID: flowID,
 		laneID: lane.laneID, kind: lane.kind, reserveControl: lane.reserveControl,
@@ -1528,6 +1530,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 	if err := c.verifyControlPath(dialCtx, generation); err != nil {
 		return nil, err
 	}
+	openedAt := time.Now()
 	stream, err := generation.conn.OpenStreamSync(dialCtx)
 	if err != nil {
 		if generation.conn.Context().Err() != nil {
@@ -1540,7 +1543,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 	c.quicPoolActive.Add(1)
 	outer := &controlPoolStreamConn{
 		quicStreamConn: &quicStreamConn{stream: stream, conn: generation.conn, controller: generation.controller, closeConn: false, bulk: connBulkPath(generation.conn, c.memoryLimits.eventQueue)},
-		owner:          c, generation: generation,
+		owner:          c, generation: generation, openedAt: openedAt,
 	}
 	transferred = true
 	return outer, nil
@@ -1774,6 +1777,7 @@ func (c *Client) completeLaneJoin(ctx context.Context, lane *authenticatedLane, 
 		_ = lane.fc.Close()
 		return nil, err
 	}
+	lane.fc.recordControlOpenProof()
 	return &mpLane{
 		id: lane.laneID, kind: lane.kind, fc: lane.fc,
 		tcpStriping: lane.tcpStriping,
@@ -1945,6 +1949,7 @@ type controlPoolStreamConn struct {
 	*quicStreamConn
 	owner      *Client
 	generation *controlQUICGeneration
+	openedAt   time.Time
 	once       sync.Once
 }
 
@@ -1955,6 +1960,7 @@ func (s *controlPoolStreamConn) transportFailed(err error) {
 	// A stream failure makes the next borrow prove the path, without killing siblings.
 	s.generation.probeMu.Lock()
 	s.generation.verified = time.Time{}
+	s.generation.invalidatedAt = time.Now()
 	s.generation.probeMu.Unlock()
 	// A stream deadline is not evidence that its sibling streams have failed.
 	if s.generation.conn.Context().Err() != nil {

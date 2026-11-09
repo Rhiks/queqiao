@@ -563,6 +563,7 @@ func (c *Client) openUDPAssociationMode(ctx context.Context, resume []byte, fast
 		_ = lane.fc.Close()
 		return nil, err
 	}
+	lane.fc.recordControlOpenProof()
 	return association, nil
 }
 

@@ -102,9 +102,12 @@ func (f *multipathFlow) forwardInbound() {
 	}
 }
 
-func (f *multipathFlow) acceptOpenConfirmation(frame protocol.Frame) error {
+func (f *multipathFlow) acceptOpenConfirmation(lane *mpLane, frame protocol.Frame) error {
 	if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID || len(frame.Payload) != 0 || !f.openConfirmationRequired.CompareAndSwap(true, false) {
 		return errors.New("unexpected flow open acknowledgement")
+	}
+	if lane != nil {
+		lane.fc.recordControlOpenProof()
 	}
 	close(f.openConfirmed)
 	return nil

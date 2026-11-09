@@ -60,6 +60,22 @@ func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration
 	}
 }
 
+// A validated OPEN_OK is proof of a round trip on this exact authenticated
+// generation. Use the stream-open time as a lower bound on its freshness: an
+// old reply read late must not extend the proof or undo a more recent failure.
+func (c *frameConn) recordControlOpenProof() {
+	outer, ok := c.transport().(*controlPoolStreamConn)
+	if !ok || time.Since(outer.openedAt) >= pooledPathProofMaxAge {
+		return
+	}
+	g := outer.generation
+	g.probeMu.Lock()
+	if g.probe == nil && outer.openedAt.After(g.verified) && outer.openedAt.After(g.invalidatedAt) {
+		g.verified = outer.openedAt
+	}
+	g.probeMu.Unlock()
+}
+
 func probeControlGeneration(ctx context.Context, g *controlQUICGeneration, budget time.Duration) error {
 	return probePooledQUIC(ctx, g.conn, budget)
 }

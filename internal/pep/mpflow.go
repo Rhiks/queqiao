@@ -1155,7 +1155,7 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 		lane.recv.Add(uint64(len(frame.Payload)))
 	}
 	if frame.Header.Type == protocol.TypeOpenOK {
-		if err := f.acceptOpenConfirmation(frame); err != nil {
+		if err := f.acceptOpenConfirmation(lane, frame); err != nil {
 			select {
 			case f.ackErr <- err:
 			default:
@@ -2972,7 +2972,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 					return nil
 				}
 			case protocol.TypeOpenOK:
-				if err := f.acceptOpenConfirmation(frame); err != nil {
+				if err := f.acceptOpenConfirmation(event.lane, frame); err != nil {
 					return err
 				}
 			case protocol.TypeReset:
