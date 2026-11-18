@@ -669,5 +669,24 @@ without redaction.
 | SOCKS test shows the wrong egress and counters stay at zero | Force proxy use with `curl --noproxy '' --proxy socks5h://…`; inspect `NO_PROXY` and the selected Clash group. |
 | Client repeatedly connects through itself | Bind enrollment, renewal, and data traffic to a physical source with `--local-address auto`, `if:NAME`, or an IP. |
 | QUIC fails but TCP works | Permit UDP on the gateway port; `--transport auto` retains TCP fallback. |
+| QUIC reports `no application protocol` on a shared gateway | [Check for overlapping UDP port redirects](#check-udp-redirects-on-a-shared-gateway). |
 | Authorization changes affect the wrong instance | Run provider commands against the exact same `--state` path used by the server unit. |
 | Every enrolled client fails after state maintenance | Restore the original provider-state backup. Do not run `provider init` over or beside it and change the service path. |
+
+### Check UDP redirects on a shared gateway
+
+A UDP port-hopping rule for another service, such as Hysteria 2, can match the
+Queqiao QUIC port and redirect packets before they reach the local socket.
+Queqiao can still show a UDP listener and accept TCP connections while QUIC
+clients negotiate with the other service and receive `no application protocol`.
+
+1. Inspect the active NAT rules with `sudo nft list ruleset` or
+   `sudo iptables -t nat -S`, according to the gateway's firewall backend.
+   Look for UDP destination ranges that include the Queqiao port. If conntrack
+   is available, inspect a matching flow with `sudo conntrack -L -p udp` and
+   compare the original destination port with the reply source port.
+2. Exclude the Queqiao port from the hopping range or assign disjoint ports.
+   Update both the active rules and the persistent firewall configuration.
+3. Start a fresh client request and verify that the gateway records a completed
+   flow over QUIC. A successful request in automatic mode can also come from
+   TCP fallback.

@@ -252,6 +252,11 @@ pathmeasure -mode workload -rounds 20 \
 Run the direct arm tuned. A comparison against an untuned client measures the
 configuration line described below, not the transport.
 
+If you already use another proxy, include that route as a baseline for the
+deployment decision. Compare the same application and destinations from the
+same client in the same time window. Keep the existing route when it delivers
+better completion times and meets the workload's reliability needs.
+
 ## The client-side fixes that come first
 
 On a path direction that does not erase, a fully tuned direct client reaches the
